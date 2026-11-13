@@ -141,7 +141,8 @@ historia suficiente.
 
 ## Hallazgos de dogfood
 
-Once bugs y huecos de raylang, con su reproducción mínima (raylang 1.27.95). Los rodeos están
+Once bugs y huecos de raylang, con su reproducción mínima (raylang 1.27.95), registrados en
+`ray-apps/findings/` (campaña `raysolve-1.27.95`) como #352–#362, en este mismo orden. Los rodeos están
 marcados en el código.
 
 1. **[B]** Un `for` sobre un iterador propio cuyo `impl` lleva bounds (`impl<V: Ord>
