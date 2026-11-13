@@ -1,0 +1,280 @@
+//! Sets of versions as sorted, disjoint intervals — the algebra PubGrub runs on.
+//!
+//! Generic over any `V: Ord + Eq + Version`. Versions are treated as dense (between
+//! `1.0.0` and `1.0.1` there are pre-releases), so `(a, b)` is non-empty whenever `a < b`.
+
+from version import Version;
+
+pub enum Bound<V> { Unbounded, Incl(V), Excl(V), }
+
+/// One interval; `lo` is a lower bound, `hi` an upper bound. Never empty once built.
+pub struct Seg<V> { lo: Bound<V>, hi: Bound<V>, }
+
+/// A union of disjoint intervals in ascending order. Empty `segs` = no version at all.
+pub struct Range<V> { segs: [Seg<V>], }
+
+pub fn empty<V>() -> Range<V> {
+    let segs: [Seg<V>] = [];
+    Range { segs: segs }
+}
+
+pub fn full<V>() -> Range<V> {
+    // the return type does not reach the variants inside the literal: annotate the bound
+    let open: Bound<V> = Bound.Unbounded;
+    Range { segs: [Seg { lo: open, hi: open }] }
+}
+
+pub fn exact<V>(v: V) -> Range<V> {
+    Range { segs: [Seg { lo: Bound.Incl(v), hi: Bound.Incl(v) }] }
+}
+
+/// `>= v`
+pub fn at_least<V>(v: V) -> Range<V> {
+    let open: Bound<V> = Bound.Unbounded;
+    Range { segs: [Seg { lo: Bound.Incl(v), hi: open }] }
+}
+
+/// `> v`
+pub fn above<V>(v: V) -> Range<V> {
+    let open: Bound<V> = Bound.Unbounded;
+    Range { segs: [Seg { lo: Bound.Excl(v), hi: open }] }
+}
+
+/// `< v`
+pub fn below<V>(v: V) -> Range<V> {
+    let open: Bound<V> = Bound.Unbounded;
+    Range { segs: [Seg { lo: open, hi: Bound.Excl(v) }] }
+}
+
+/// `<= v`
+pub fn at_most<V>(v: V) -> Range<V> {
+    let open: Bound<V> = Bound.Unbounded;
+    Range { segs: [Seg { lo: open, hi: Bound.Incl(v) }] }
+}
+
+/// `[lo, hi)`, or empty when `hi <= lo`.
+pub fn between<V: Ord>(lo: V, hi: V) -> Range<V> {
+    if (lo.less(hi)) { Range { segs: [Seg { lo: Bound.Incl(lo), hi: Bound.Excl(hi) }] } } else { empty() }
+}
+
+pub fn is_empty<V>(r: Range<V>) -> bool { r.segs.len() == 0 }
+
+pub fn is_full<V>(r: Range<V>) -> bool {
+    if (r.segs.len() != 1) { return false; }
+    let s = r.segs[0];
+    let lo_open = match (s.lo) { Bound.Unbounded => true, _ => false, };
+    let hi_open = match (s.hi) { Bound.Unbounded => true, _ => false, };
+    lo_open && hi_open
+}
+
+fn above_lo<V: Ord>(b: Bound<V>, v: V) -> bool {
+    match (b) {
+        Bound.Unbounded => true,
+        Bound.Incl(x) => !v.less(x),
+        Bound.Excl(x) => x.less(v),
+    }
+}
+
+fn below_hi<V: Ord>(b: Bound<V>, v: V) -> bool {
+    match (b) {
+        Bound.Unbounded => true,
+        Bound.Incl(x) => !x.less(v),
+        Bound.Excl(x) => v.less(x),
+    }
+}
+
+pub fn contains<V: Ord>(r: Range<V>, v: V) -> bool {
+    for s in r.segs {
+        if (above_lo(s.lo, v) && below_hi(s.hi, v)) { return true; }
+        // segments are ascending: once v is below a segment's start it cannot be in a later one
+        if (!above_lo(s.lo, v)) { return false; }
+    }
+    false
+}
+
+/// Does the lower bound `a` admit less than `b` (start earlier)? Ties go to `Incl`.
+fn lo_before<V: Ord>(a: Bound<V>, b: Bound<V>) -> bool {
+    match (a) {
+        Bound.Unbounded => true,
+        Bound.Incl(x) => match (b) {
+            Bound.Unbounded => false,
+            Bound.Incl(y) => !y.less(x),
+            Bound.Excl(y) => !y.less(x),
+        },
+        Bound.Excl(x) => match (b) {
+            Bound.Unbounded => false,
+            Bound.Incl(y) => x.less(y),
+            Bound.Excl(y) => !y.less(x),
+        },
+    }
+}
+
+/// Does the upper bound `a` end before `b` (or at the same place)? Ties go to `Excl`.
+fn hi_before<V: Ord>(a: Bound<V>, b: Bound<V>) -> bool {
+    match (a) {
+        Bound.Unbounded => match (b) { Bound.Unbounded => true, _ => false, },
+        Bound.Incl(x) => match (b) {
+            Bound.Unbounded => true,
+            Bound.Incl(y) => !y.less(x),
+            Bound.Excl(y) => x.less(y),
+        },
+        Bound.Excl(x) => match (b) {
+            Bound.Unbounded => true,
+            Bound.Incl(y) => !y.less(x),
+            Bound.Excl(y) => !y.less(x),
+        },
+    }
+}
+
+/// Is `[lo, hi]` (with those bound kinds) non-empty?
+fn nonempty<V: Ord>(lo: Bound<V>, hi: Bound<V>) -> bool {
+    match (lo) {
+        Bound.Unbounded => true,
+        Bound.Incl(a) => match (hi) {
+            Bound.Unbounded => true,
+            Bound.Incl(b) => !b.less(a),
+            Bound.Excl(b) => a.less(b),
+        },
+        Bound.Excl(a) => match (hi) {
+            Bound.Unbounded => true,
+            Bound.Incl(b) => a.less(b),
+            Bound.Excl(b) => a.less(b),
+        },
+    }
+}
+
+pub fn intersect<V: Ord>(a: Range<V>, b: Range<V>) -> Range<V> {
+    var out: [Seg<V>] = [];
+    var i = 0;
+    var j = 0;
+    while (i < a.segs.len() && j < b.segs.len()) {
+        let x = a.segs[i];
+        let y = b.segs[j];
+        let lo = if (lo_before(x.lo, y.lo)) { y.lo } else { x.lo };
+        let hi = if (hi_before(x.hi, y.hi)) { x.hi } else { y.hi };
+        if (nonempty(lo, hi)) { out.push(Seg { lo: lo, hi: hi }); }
+        if (hi_before(x.hi, y.hi)) { i = i + 1; } else { j = j + 1; }
+    }
+    Range { segs: out }
+}
+
+pub fn complement<V>(r: Range<V>) -> Range<V> {
+    var out: [Seg<V>] = [];
+    var lo: Bound<V> = Bound.Unbounded;
+    for s in r.segs {
+        match (s.lo) {
+            Bound.Unbounded => { },
+            Bound.Incl(x) => out.push(Seg { lo: lo, hi: Bound.Excl(x) }),
+            Bound.Excl(x) => out.push(Seg { lo: lo, hi: Bound.Incl(x) }),
+        }
+        match (s.hi) {
+            Bound.Unbounded => return Range { segs: out },
+            Bound.Incl(x) => lo = Bound.Excl(x),
+            Bound.Excl(x) => lo = Bound.Incl(x),
+        }
+    }
+    let open: Bound<V> = Bound.Unbounded;
+    out.push(Seg { lo: lo, hi: open });
+    Range { segs: out }
+}
+
+pub fn union<V: Ord>(a: Range<V>, b: Range<V>) -> Range<V> {
+    complement(intersect(complement(a), complement(b)))
+}
+
+/// Every version of `a` is in `b`.
+pub fn subset_of<V: Ord>(a: Range<V>, b: Range<V>) -> bool {
+    is_empty(intersect(a, complement(b)))
+}
+
+pub fn disjoint<V: Ord>(a: Range<V>, b: Range<V>) -> bool { is_empty(intersect(a, b)) }
+
+fn bound_eq<V: Eq>(a: Bound<V>, b: Bound<V>) -> bool {
+    match (a) {
+        Bound.Unbounded => match (b) { Bound.Unbounded => true, _ => false, },
+        Bound.Incl(x) => match (b) { Bound.Incl(y) => x == y, _ => false, },
+        Bound.Excl(x) => match (b) { Bound.Excl(y) => x == y, _ => false, },
+    }
+}
+
+/// Same set of versions (both sides are normalized, so this is structural).
+pub fn same<V: Eq>(a: Range<V>, b: Range<V>) -> bool {
+    if (a.segs.len() != b.segs.len()) { return false; }
+    var i = 0;
+    while (i < a.segs.len()) {
+        if (!bound_eq(a.segs[i].lo, b.segs[i].lo) || !bound_eq(a.segs[i].hi, b.segs[i].hi)) { return false; }
+        i = i + 1;
+    }
+    true
+}
+
+/// The lowest version the range admits, if it has an inclusive or exclusive floor.
+pub fn floor<V>(r: Range<V>) -> Option<V> {
+    if (r.segs.len() == 0) { return Option.None; }
+    match (r.segs[0].lo) {
+        Bound.Unbounded => Option.None,
+        Bound.Incl(v) => Option.Some(v),
+        Bound.Excl(v) => Option.Some(v),
+    }
+}
+
+/// Human form: `*`, `1.2.3`, `^0.14.0`, `>=1.0.0, <1.5.0`, joined with ` || `.
+pub fn show_range<V: Ord + Eq + Version>(r: Range<V>) -> string {
+    if (is_empty(r)) { return "∅"; }
+    if (is_full(r)) { return "*"; }
+    var parts: [string] = [];
+    for s in r.segs { parts.push(show_seg(s)); }
+    parts.join(" || ")
+}
+
+fn show_seg<V: Ord + Eq + Version>(s: Seg<V>) -> string {
+    match (s.lo) {
+        Bound.Incl(a) => match (s.hi) {
+            Bound.Incl(b) => if (a == b) { return a.label(); },
+            Bound.Excl(b) => match (a.caret_upper()) {
+                Option.Some(c) => if (c == b) { return "^" + a.label(); },
+                Option.None => { },
+            },
+            Bound.Unbounded => { },
+        },
+        _ => { },
+    }
+    let lo = match (s.lo) {
+        Bound.Unbounded => "",
+        Bound.Incl(a) => ">=" + a.label(),
+        Bound.Excl(a) => ">" + a.label(),
+    };
+    let hi = match (s.hi) {
+        Bound.Unbounded => "",
+        Bound.Incl(b) => "<=" + b.label(),
+        Bound.Excl(b) => "<" + b.label(),
+    };
+    if (lo == "") { hi } else if (hi == "") { lo } else { lo + ", " + hi }
+}
+
+/// The versions of a sorted list that fall in a range, lazily, in order.
+///
+/// Implemented by hand because the list is filtered with the range's own bounds walk
+/// (one pass, no re-scan per segment). NOTE: a `for` over this iterator crashes both engines
+/// when the `impl` carries a bound (see the README's findings), so callers drive `next()`.
+pub struct InRange<V> { xs: [V], i: int, seg: int, r: Range<V>, }
+
+pub fn in_range<V>(xs: [V], r: Range<V>) -> InRange<V> { InRange { xs: xs, i: 0, seg: 0, r: r } }
+
+impl<V: Ord> Iterator<V> for InRange<V> {
+    fn next(self) -> Option<V> {
+        while (self.i < self.xs.len() && self.seg < self.r.segs.len()) {
+            let v = self.xs[self.i];
+            let s = self.r.segs[self.seg];
+            if (!above_lo(s.lo, v)) {
+                self.i = self.i + 1;
+            } else if (!below_hi(s.hi, v)) {
+                self.seg = self.seg + 1;
+            } else {
+                self.i = self.i + 1;
+                return Option.Some(v);
+            }
+        }
+        Option.None
+    }
+}

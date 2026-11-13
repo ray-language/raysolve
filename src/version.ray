@@ -1,0 +1,24 @@
+//! What the generic solver needs from a version type, beyond `Ord + Hash + Eq + Show`.
+//!
+//! raylang has no supertraits (`trait Version: Ord + Hash` is a syntax error), so the
+//! solver spells the full bound at every generic function instead:
+//! `V: Ord + Hash + Eq + Show + Version`.
+
+/// A version the solver can pick.
+pub trait Version {
+    /// Pre-releases are only picked when nothing else fits and the caller allows them.
+    fn is_prerelease(self) -> bool;
+    /// The version as people write it (`1.2.3-rc.1`), for reports.
+    fn label(self) -> string;
+    /// Where a caret requirement starting at this version ends (`^0.14.2` → `0.15.0`), when the
+    /// version scheme has one. Reports use it to print `^0.14.2` instead of `>=0.14.2, <0.15.0`.
+    fn caret_upper(self) -> Option<Self>;
+}
+
+/// Plain integers are versions too: the synthetic indexes and many tests use them,
+/// which keeps the solver honest about being generic.
+impl Version for int {
+    fn is_prerelease(self) -> bool { false }
+    fn label(self) -> string { to_string(self) }
+    fn caret_upper(self) -> Option<int> { Option.None }
+}

@@ -1,0 +1,7 @@
+[package]
+name = "raysolve"
+version = "0.1.0"
+license = "Apache-2.0"
+raylang = "1.27.94"
+
+[dependencies]
