@@ -1,0 +1,176 @@
+// The generic PubGrub solver over int versions and string packages: an in-memory index
+// written as a table, solutions, conflicts and their explanations.
+
+import explain;
+import pubgrub;
+import range;
+from pubgrub import Dep, Outcome, Provider;
+from range import Range;
+
+/// "a 1 -> b >=2 <4, c 1" lines: package, version, then deps as name lo hi (hi 0 = open).
+fn index(lines: [string]) -> Provider<string, int> {
+    var vers: Map<string, [int]> = Map.new();
+    var deps: Map<string, [Dep<string, int>]> = Map.new();
+    for line in lines {
+        let halves = line.split("->");
+        let head = halves[0].trim().split(" ");
+        let name = head[0];
+        let v = parse_int(head[1]).unwrap();
+        var vs = vers.get_or(name, []);
+        vs.push(v);
+        vers.insert(name, sort(vs));
+        var ds: [Dep<string, int>] = [];
+        if (halves.len() > 1) {
+            for d in halves[1].split(",") {
+                let f = d.trim().split(" ");
+                let lo = parse_int(f[1]).unwrap();
+                let hi = parse_int(f[2]).unwrap();
+                let r: Range<int> = if (hi == 0) { range.at_least(lo) } else { range.between(lo, hi) };
+                ds.push((f[0], r));
+            }
+        }
+        deps.insert("${name}@${v}", ds);
+    }
+    Provider {
+        versions: fn(p: string) -> Result<[int], string> { Result.Ok(vers.get_or(p, [])) },
+        deps: fn(p: string, v: int) -> Result<[Dep<string, int>], string> {
+            match (deps.get("${p}@${v}")) {
+                Option.Some(ds) => Result.Ok(ds),
+                Option.None => Result.Err("no such release ${p}@${v}"),
+            }
+        },
+    }
+}
+
+fn solve(lines: [string]) -> Outcome<string, int> {
+    pubgrub.solve(index(lines), "root", 1, pubgrub.options())
+}
+
+fn picks(o: Outcome<string, int>) -> string {
+    match (o) {
+        Outcome.Solved(s) => {
+            var xs: [string] = [];
+            for p in s.picks { xs.push("${p.0}=${p.1}"); }
+            sort(xs).join(" ")
+        },
+        Outcome.NoSolution(f) => "FAIL:\n" + explain.explain(f),
+        Outcome.Error(e) => "ERROR: " + e,
+    }
+}
+
+fn failure(o: Outcome<string, int>) -> string {
+    match (o) {
+        Outcome.NoSolution(f) => explain.explain(f),
+        _ => "expected a failure, got: " + picks(o),
+    }
+}
+
+@test
+fn picks_the_newest_compatible() {
+    let o = solve([
+        "root 1 -> a 1 0",
+        "a 1 -> b 1 2",
+        "a 2 -> b 2 3",
+        "b 1", "b 2", "b 3",
+    ]);
+    assert_eq(picks(o), "a=2 b=2 root=1");
+}
+
+@test
+fn backtracks_on_conflict() {
+    // pub's "avoids a conflict" scenario: the newest foo pulls a bar that clashes
+    let o = solve([
+        "root 1 -> foo 1 2, bar 1 2",
+        "foo 1 -> bar 1 2",
+        "foo 1 -> bar 1 2",
+        "bar 1",
+    ]);
+    assert_eq(picks(o), "bar=1 foo=1 root=1");
+    let o2 = solve([
+        "root 1 -> foo 1 0",
+        "foo 1",
+        "foo 2 -> bar 5 6",
+        "bar 1",
+    ]);
+    // foo 2 needs a bar that does not exist: fall back to foo 1
+    assert_eq(picks(o2), "foo=1 root=1");
+}
+
+@test
+fn conflict_resolution_with_partial_satisfier() {
+    // pubgrub doc example "conflict resolution with a partial satisfier"
+    let o = solve([
+        "root 1 -> foo 1 2, target 2 3",
+        "foo 1 -> left 1 2, right 1 2",
+        "foo 1",
+        "left 1 -> shared 1 0",
+        "right 1 -> shared 0 2",
+        "shared 2",
+        "shared 1 -> target 1 2",
+        "target 2", "target 1",
+    ]);
+    assert(!picks(o).starts_with("FAIL"));
+}
+
+@test
+fn no_solution_is_explained() {
+    let o = solve([
+        "root 1 -> foo 1 2, bar 1 2",
+        "foo 1 -> baz 1 2",
+        "bar 1 -> baz 2 3",
+        "baz 1", "baz 2",
+    ]);
+    let text = failure(o);
+    assert_eq(text, `Because every version of bar depends on baz >=2, <3 and every version of foo depends on baz >=1, <2, every version of bar is incompatible with every version of foo.
+And because root depends on foo >=1, <2, every version of bar is forbidden.
+So, because root depends on bar >=1, <2, version solving failed.`);
+}
+
+@test
+fn missing_package_is_explained() {
+    let text = failure(solve(["root 1 -> ghost 1 0"]));
+    assert_eq(text, "Because no versions of ghost match >=1 and root depends on ghost >=1, version solving failed.");
+}
+
+@test
+fn learns_and_backjumps() {
+    // a long chain where only the oldest top version works: conflict learning must
+    // not try every combination of the middle packages
+    let o = solve([
+        "root 1 -> a 1 0",
+        "a 1 -> b 1 0",
+        "a 2 -> b 1 0, x 2 3",
+        "a 3 -> b 1 0, x 3 4",
+        "b 1", "b 2", "b 3",
+        "x 1",
+    ]);
+    assert_eq(picks(o), "a=1 b=3 root=1");
+    match (o) {
+        Outcome.Solved(s) => assert(s.stats.conflicts <= 4),
+        _ => assert(false),
+    }
+}
+
+@test
+fn tree_walk_iterates_the_derivations() {
+    let o = solve([
+        "root 1 -> foo 1 2, bar 1 2",
+        "foo 1 -> baz 1 2",
+        "bar 1 -> baz 2 3",
+        "baz 1", "baz 2",
+    ]);
+    match (o) {
+        Outcome.NoSolution(f) => {
+            var n = 0;
+            var deepest = 0;
+            for (idx, depth) in explain.walk(f) {
+                n = n + 1;
+                if (depth > deepest) { deepest = depth; }
+            }
+            assert(n >= 5);
+            assert(deepest >= 2);
+            assert(explain.tree(f).contains("▸ version solving failed"));
+        },
+        _ => assert(false),
+    }
+}

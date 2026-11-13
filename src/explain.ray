@@ -1,0 +1,259 @@
+//! Turning a failure's derivation graph into sentences a person can follow:
+//!
+//!   Because web >=0.6.0 depends on net ^0.11.0 and app depends on net ^0.14.0,
+//!     web >=0.6.0 is forbidden.
+//!   So, because app depends on web ^0.6.0, version solving failed.
+//!
+//! The walk follows pub's error reporting: external causes are stated, derived ones are
+//! explained first (and numbered when several conclusions reuse them).
+
+import range;
+import pubgrub;
+from pubgrub import Cause, Failure, Incompat, Term;
+from range import Range;
+from version import Version;
+
+/// Pre-order walk of the derivation graph below an incompatibility: yields
+/// (incompatibility index, depth). A derived incompatibility reached twice is walked twice,
+/// which is what a tree printout wants. The `impl` has no bounds, so `for` works on it.
+pub struct TreeWalk<P, V> { incompats: [Incompat<P, V>], stack: [(int, int)], }
+
+pub fn walk<P, V>(f: Failure<P, V>) -> TreeWalk<P, V> {
+    TreeWalk { incompats: f.incompats, stack: [(f.last, 0)] }
+}
+
+impl<P, V> Iterator<(int, int)> for TreeWalk<P, V> {
+    fn next(self) -> Option<(int, int)> {
+        match (self.stack.pop()) {
+            Option.None => Option.None,
+            Option.Some(top) => {
+                match (self.incompats[top.0].cause) {
+                    Cause.Derived(a, b) => {
+                        // push b first so a comes out first
+                        self.stack.push((b, top.1 + 1));
+                        self.stack.push((a, top.1 + 1));
+                    },
+                    _ => { },
+                }
+                Option.Some(top)
+            },
+        }
+    }
+}
+
+fn is_derived<P, V>(inc: Incompat<P, V>) -> bool {
+    match (inc.cause) { Cause.Derived(_, _) => true, _ => false, }
+}
+
+/// `web ^0.6.0`, `every version of web`, or just `app` for the root package.
+pub fn show_term_body<P: Eq + Show, V: Ord + Eq + Version>(root: P, p: P, r: Range<V>) -> string {
+    if (p == root) { return p.show(); }
+    if (range.is_full(r)) { return "every version of ${p.show()}"; }
+    "${p.show()} ${range.show_range(r)}"
+}
+
+fn body<P: Eq + Show, V: Ord + Eq + Version>(root: P, t: Term<P, V>) -> string {
+    show_term_body(root, pubgrub.term_pkg(t), pubgrub.term_range(t))
+}
+
+/// One incompatibility as a sentence fragment (no trailing period).
+pub fn describe<P: Eq + Show, V: Ord + Eq + Version>(root: P, inc: Incompat<P, V>) -> string {
+    let ts = inc.terms;
+    match (inc.cause) {
+        Cause.Root => return "${root.show()} is the project being solved",
+        Cause.Dependency => {
+            if (ts.len() == 2) {
+                let depender = body(root, ts[0]);
+                let target = pubgrub.term_pkg(ts[1]);
+                let r = pubgrub.term_range(ts[1]);
+                if (range.is_full(r)) { return "${depender} depends on ${target.show()}"; }
+                return "${depender} depends on ${target.show()} ${range.show_range(r)}";
+            }
+        },
+        Cause.NoVersions => {
+            if (ts.len() == 1) {
+                let r = pubgrub.term_range(ts[0]);
+                let p = pubgrub.term_pkg(ts[0]);
+                if (range.is_full(r)) { return "no versions of ${p.show()} exist in the index"; }
+                return "no versions of ${p.show()} match ${range.show_range(r)}";
+            }
+        },
+        Cause.Unavailable(msg) => {
+            if (ts.len() == 1) { return "${body(root, ts[0])} is unavailable (${msg})"; }
+        },
+        Cause.Derived(_, _) => { },
+    }
+    // derived (or unusual) shapes
+    if (ts.len() == 0) { return "version solving failed"; }
+    if (ts.len() == 1) {
+        let t = ts[0];
+        if (pubgrub.is_pos(t)) {
+            if (pubgrub.term_pkg(t) == root) { return "version solving failed"; }
+            return "${body(root, t)} is forbidden";
+        }
+        return "${body(root, t)} is required";
+    }
+    if (ts.len() == 2) {
+        let a = ts[0];
+        let b = ts[1];
+        // "root and bar 1 cannot both be selected" is "bar 1 is forbidden"
+        if (is_root_pos(root, a) && pubgrub.is_pos(b)) { return "${body(root, b)} is forbidden"; }
+        if (is_root_pos(root, b) && pubgrub.is_pos(a)) { return "${body(root, a)} is forbidden"; }
+        if (pubgrub.is_pos(a) && !pubgrub.is_pos(b)) { return "${body(root, a)} requires ${body(root, b)}"; }
+        if (pubgrub.is_pos(b) && !pubgrub.is_pos(a)) { return "${body(root, b)} requires ${body(root, a)}"; }
+        if (pubgrub.is_pos(a) && pubgrub.is_pos(b)) { return "${body(root, a)} is incompatible with ${body(root, b)}"; }
+        return "either ${body(root, a)} or ${body(root, b)}";
+    }
+    var pos: [string] = [];
+    var neg: [string] = [];
+    for t in ts {
+        if (pubgrub.is_pos(t)) { pos.push(body(root, t)); } else { neg.push(body(root, t)); }
+    }
+    if (neg.len() == 0) { return "${pos.join(", ")} cannot all be selected"; }
+    if (pos.len() == 1) { return "${pos[0]} requires ${neg.join(" or ")}"; }
+    "if ${pos.join(" and ")} then ${neg.join(" or ")}"
+}
+
+fn is_root_pos<P: Eq, V>(root: P, t: Term<P, V>) -> bool { pubgrub.is_pos(t) && pubgrub.term_pkg(t) == root }
+
+struct Report {
+    lines: [string],
+    /// incompatibility index -> line number (1-based), for the ones worth numbering
+    numbered: Map<int, int>,
+    /// incompatibility index -> how many derived incompatibilities cite it
+    refs: Map<int, int>,
+    /// incompatibility index -> line index where it was concluded
+    concluded: Map<int, int>,
+    next_number: int,
+}
+
+/// The failure as numbered English, one sentence per line.
+pub fn explain<P: Eq + Show, V: Ord + Eq + Version>(f: Failure<P, V>) -> string {
+    let rep = Report { lines: [], numbered: Map.new(), refs: Map.new(), concluded: Map.new(), next_number: 1 };
+    // count how often each derived incompatibility is cited, walking each one once
+    var seen: Map<int, bool> = Map.new();
+    var stack = [f.last];
+    while (stack.len() > 0) {
+        let i = stack.pop().unwrap();
+        if (seen.contains_key(i)) { continue; }
+        seen.insert(i, true);
+        match (f.incompats[i].cause) {
+            Cause.Derived(a, b) => {
+                rep.refs.insert(a, rep.refs.get_or(a, 0) + 1);
+                rep.refs.insert(b, rep.refs.get_or(b, 0) + 1);
+                stack.push(a);
+                stack.push(b);
+            },
+            _ => { },
+        }
+    }
+    let last = f.incompats[f.last];
+    if (!is_derived(last)) {
+        return "Because ${describe(f.root, last)}, version solving failed.";
+    }
+    visit(f, rep, f.last, true);
+    let n = rep.lines.len();
+    if (n > 1) {
+        let text = rep.lines[n - 1];
+        rep.lines[n - 1] = "So, " + lower_first(text.strip_prefix("And ").unwrap_or(text));
+    }
+    var out: [string] = [];
+    var width = 0;
+    for (_, n) in rep.numbered {
+        let w = "(${n}) ".len();
+        if (w > width) { width = w; }
+    }
+    var i = 0;
+    while (i < rep.lines.len()) {
+        var tag = "";
+        for (inc, li) in rep.concluded {
+            if (li == i) {
+                match (rep.numbered.get(inc)) {
+                    Option.Some(n) => tag = "(${n}) ",
+                    Option.None => { },
+                }
+            }
+        }
+        out.push(pad(tag, width) + rep.lines[i]);
+        i = i + 1;
+    }
+    out.join("\n")
+}
+
+fn pad(s: string, w: int) -> string { s + " ".repeat(w - s.len()) }
+
+fn write<P: Eq + Show, V: Ord + Eq + Version>(f: Failure<P, V>, rep: Report, idx: int, text: string, last: bool) {
+    rep.lines.push(text);
+    rep.concluded.insert(idx, rep.lines.len() - 1);
+    if (rep.refs.get_or(idx, 0) > 1) {
+        rep.numbered.insert(idx, rep.next_number);
+        rep.next_number = rep.next_number + 1;
+    }
+}
+
+fn lower_first(s: string) -> string {
+    if (s.len() == 0) { return s; }
+    s.substring(0, 1).to_lower() + s.substring(1, s.len())
+}
+
+fn ref_text<P: Eq + Show, V: Ord + Eq + Version>(f: Failure<P, V>, rep: Report, idx: int) -> string {
+    let d = describe(f.root, f.incompats[idx]);
+    match (rep.numbered.get(idx)) {
+        Option.Some(n) => "${d} (${n})",
+        Option.None => d,
+    }
+}
+
+fn visit<P: Eq + Show, V: Ord + Eq + Version>(f: Failure<P, V>, rep: Report, idx: int, last: bool) {
+    let inc = f.incompats[idx];
+    let (a, b) = match (inc.cause) {
+        Cause.Derived(a, b) => (a, b),
+        _ => return,
+    };
+    let conclusion = describe(f.root, inc);
+    let da = is_derived(f.incompats[a]);
+    let db = is_derived(f.incompats[b]);
+    if (da && db) {
+        let na = rep.numbered.contains_key(a);
+        let nb = rep.numbered.contains_key(b);
+        if (na && nb) {
+            write(f, rep, idx, "Because ${ref_text(f, rep, a)} and ${ref_text(f, rep, b)}, ${conclusion}.", last);
+        } else if (na || nb) {
+            let fresh = if (na) { b } else { a };
+            let known = if (na) { a } else { b };
+            visit(f, rep, fresh, false);
+            write(f, rep, idx, "And because ${ref_text(f, rep, known)}, ${conclusion}.", last);
+        } else {
+            visit(f, rep, a, false);
+            if (!rep.numbered.contains_key(a)) {
+                // the second branch will bury this line: number it so it can be cited
+                rep.numbered.insert(a, rep.next_number);
+                rep.next_number = rep.next_number + 1;
+            }
+            visit(f, rep, b, false);
+            write(f, rep, idx, "And because ${ref_text(f, rep, a)}, ${conclusion}.", last);
+        }
+    } else if (da || db) {
+        let derived = if (da) { a } else { b };
+        let external = if (da) { b } else { a };
+        if (rep.numbered.contains_key(derived)) {
+            write(f, rep, idx, "Because ${describe(f.root, f.incompats[external])} and ${ref_text(f, rep, derived)}, ${conclusion}.", last);
+        } else {
+            visit(f, rep, derived, false);
+            write(f, rep, idx, "And because ${describe(f.root, f.incompats[external])}, ${conclusion}.", last);
+        }
+    } else {
+        write(f, rep, idx, "Because ${describe(f.root, f.incompats[a])} and ${describe(f.root, f.incompats[b])}, ${conclusion}.", last);
+    }
+}
+
+/// The derivation tree, indented, one incompatibility per line (`raysolve resolve --tree`).
+pub fn tree<P: Eq + Show, V: Ord + Eq + Version>(f: Failure<P, V>) -> string {
+    var out: [string] = [];
+    for (idx, depth) in walk(f) {
+        let inc = f.incompats[idx];
+        let mark = if (is_derived(inc)) { "▸" } else { "·" };
+        out.push("${"  ".repeat(depth)}${mark} ${describe(f.root, inc)}");
+    }
+    out.join("\n")
+}

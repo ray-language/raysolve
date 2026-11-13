@@ -1,0 +1,614 @@
+//! PubGrub version solving (Natalie Weizenbaum's algorithm, as in Dart's pub and pubgrub-rs):
+//! unit propagation over incompatibilities, conflict-driven learning with backjumping, and a
+//! derivation graph that explains a failure in human terms (see `explain`).
+//!
+//! Generic over the package type `P` and the version type `V`. raylang has no supertraits and
+//! no generic traits in bounds (`S: Source<V>` does not parse), so the bound is spelled in full
+//! and the package index reaches the solver as a `Provider` of two closures.
+
+import std/collections/dict;
+import range;
+from std/collections/dict import Dict;
+from range import Range;
+from version import Version;
+
+/// `Pos(p, r)`: p is selected at a version in r. `Neg(p, r)`: p is not selected in r
+/// (it may not be selected at all).
+pub enum Term<P, V> { Pos(P, Range<V>), Neg(P, Range<V>), }
+
+/// Why an incompatibility holds. `Derived(a, b)` points at the two incompatibilities
+/// (indices into `State.incompats`) conflict resolution combined.
+pub enum Cause { Root, NoVersions, Dependency, Unavailable(string), Derived(int, int), }
+
+/// A set of terms that cannot all be true at once.
+pub struct Incompat<P, V> { terms: [Term<P, V>], cause: Cause, }
+
+/// A dependency as the provider reports it: package and the versions it accepts.
+pub type Dep<P, V> = (P, Range<V>);
+
+/// The package index, as the solver sees it. `versions` returns ascending versions.
+pub struct Provider<P, V> {
+    versions: fn(P) -> Result<[V], string>,
+    deps: fn(P, V) -> Result<[Dep<P, V>], string>,
+}
+
+pub struct Stats {
+    decisions: int,
+    derivations: int,
+    conflicts: int,
+    backjumps: int,
+    incompats: int,
+}
+
+pub struct Solution<P, V> { picks: [(P, V)], stats: Stats, }
+
+pub struct Failure<P, V> { root: P, incompats: [Incompat<P, V>], last: int, stats: Stats, }
+
+pub enum Outcome<P, V> { Solved(Solution<P, V>), NoSolution(Failure<P, V>), Error(string), }
+
+struct Assignment<P, V> {
+    term: Term<P, V>,
+    level: int,
+    /// index of the incompatibility that forced it; -1 for a decision
+    cause: int,
+}
+
+struct State<P, V> {
+    root: P,
+    provider: Provider<P, V>,
+    incompats: [Incompat<P, V>],
+    by_pkg: Dict<P, [int]>,
+    assigns: [Assignment<P, V>],
+    assigned: Dict<P, [int]>,
+    /// the intersection of every assignment of a package, kept in step with `assigns`
+    acc: Dict<P, Term<P, V>>,
+    decided: Dict<P, V>,
+    /// packages in the order they first got an assignment (deterministic decisions)
+    seen: [P],
+    level: int,
+    versions: Dict<P, [V]>,
+    stats: Stats,
+}
+
+// ---------------------------------------------------------------- terms
+
+pub fn term_pkg<P, V>(t: Term<P, V>) -> P {
+    match (t) { Term.Pos(p, _) => p, Term.Neg(p, _) => p, }
+}
+
+pub fn term_range<P, V>(t: Term<P, V>) -> Range<V> {
+    match (t) { Term.Pos(_, r) => r, Term.Neg(_, r) => r, }
+}
+
+pub fn is_pos<P, V>(t: Term<P, V>) -> bool {
+    match (t) { Term.Pos(_, _) => true, Term.Neg(_, _) => false, }
+}
+
+fn negate<P, V>(t: Term<P, V>) -> Term<P, V> {
+    match (t) { Term.Pos(p, r) => Term.Neg(p, r), Term.Neg(p, r) => Term.Pos(p, r), }
+}
+
+/// "p is anything (or nothing)": the neutral element of term intersection.
+fn any_term<P, V>(p: P) -> Term<P, V> {
+    let none: Range<V> = range.empty();
+    Term.Neg(p, none)
+}
+
+fn intersect_terms<P, V: Ord>(a: Term<P, V>, b: Term<P, V>) -> Term<P, V> {
+    match (a) {
+        Term.Pos(p, x) => match (b) {
+            Term.Pos(_, y) => Term.Pos(p, range.intersect(x, y)),
+            Term.Neg(_, y) => Term.Pos(p, range.intersect(x, range.complement(y))),
+        },
+        Term.Neg(p, x) => match (b) {
+            Term.Pos(_, y) => Term.Pos(p, range.intersect(y, range.complement(x))),
+            Term.Neg(_, y) => Term.Neg(p, range.union(x, y)),
+        },
+    }
+}
+
+/// Every state allowed by `a` is allowed by `b`.
+fn term_subset<P, V: Ord>(a: Term<P, V>, b: Term<P, V>) -> bool {
+    match (a) {
+        Term.Pos(_, x) => match (b) {
+            Term.Pos(_, y) => range.subset_of(x, y),
+            Term.Neg(_, y) => range.disjoint(x, y),
+        },
+        Term.Neg(_, x) => match (b) {
+            Term.Pos(_, _) => false,
+            Term.Neg(_, y) => range.subset_of(y, x),
+        },
+    }
+}
+
+fn term_disjoint<P, V: Ord>(a: Term<P, V>, b: Term<P, V>) -> bool {
+    match (a) {
+        Term.Pos(_, x) => match (b) {
+            Term.Pos(_, y) => range.disjoint(x, y),
+            Term.Neg(_, y) => range.subset_of(x, y),
+        },
+        Term.Neg(_, x) => match (b) {
+            Term.Pos(_, y) => range.subset_of(y, x),
+            Term.Neg(_, _) => false,
+        },
+    }
+}
+
+fn is_any<P, V>(t: Term<P, V>) -> bool {
+    match (t) { Term.Neg(_, r) => range.is_empty(r), Term.Pos(_, _) => false, }
+}
+
+// ---------------------------------------------------------------- state
+
+fn add_incompat<P: Hash + Eq, V>(st: State<P, V>, inc: Incompat<P, V>) -> int {
+    let idx = st.incompats.len();
+    st.incompats.push(inc);
+    st.stats.incompats = st.stats.incompats + 1;
+    for t in inc.terms {
+        let p = term_pkg(t);
+        var list = dict.get(st.by_pkg, p).unwrap_or([]);
+        list.push(idx);
+        dict.insert(st.by_pkg, p, list);
+    }
+    idx
+}
+
+/// Store a derived incompatibility for the explanation without indexing it for propagation.
+fn store_incompat<P, V>(st: State<P, V>, inc: Incompat<P, V>) -> int {
+    st.incompats.push(inc);
+    st.stats.incompats = st.stats.incompats + 1;
+    st.incompats.len() - 1
+}
+
+fn index_incompat<P: Hash + Eq, V>(st: State<P, V>, idx: int) {
+    for t in st.incompats[idx].terms {
+        let p = term_pkg(t);
+        var list = dict.get(st.by_pkg, p).unwrap_or([]);
+        if (!list.contains(idx)) {
+            list.push(idx);
+            dict.insert(st.by_pkg, p, list);
+        }
+    }
+}
+
+fn accumulated<P: Hash + Eq, V>(st: State<P, V>, p: P) -> Term<P, V> {
+    match (dict.get(st.acc, p)) {
+        Option.Some(t) => t,
+        Option.None => any_term(p),
+    }
+}
+
+fn assign<P: Hash + Eq, V: Ord>(st: State<P, V>, t: Term<P, V>, cause: int) {
+    let p = term_pkg(t);
+    st.assigns.push(Assignment { term: t, level: st.level, cause: cause });
+    var list = dict.get(st.assigned, p).unwrap_or([]);
+    if (list.len() == 0) { st.seen.push(p); }
+    list.push(st.assigns.len() - 1);
+    dict.insert(st.assigned, p, list);
+    dict.insert(st.acc, p, intersect_terms(accumulated(st, p), t));
+}
+
+fn derive<P: Hash + Eq, V: Ord>(st: State<P, V>, t: Term<P, V>, cause: int) {
+    st.stats.derivations = st.stats.derivations + 1;
+    assign(st, t, cause);
+}
+
+fn decide<P: Hash + Eq, V: Ord>(st: State<P, V>, p: P, v: V) {
+    st.level = st.level + 1;
+    st.stats.decisions = st.stats.decisions + 1;
+    assign(st, Term.Pos(p, range.exact(v)), -1);
+    dict.insert(st.decided, p, v);
+}
+
+/// Drop every assignment above `level` and rebuild the per-package views.
+fn backtrack<P: Hash + Eq, V: Ord>(st: State<P, V>, level: int) {
+    st.stats.backjumps = st.stats.backjumps + 1;
+    var keep: [Assignment<P, V>] = [];
+    for a in st.assigns {
+        if (a.level <= level) { keep.push(a); }
+    }
+    st.assigns = keep;
+    st.assigned = dict.new();
+    st.acc = dict.new();
+    st.decided = dict.new();
+    let old_seen = st.seen;
+    st.seen = [];
+    var i = 0;
+    while (i < keep.len()) {
+        let a = keep[i];
+        let p = term_pkg(a.term);
+        var list = dict.get(st.assigned, p).unwrap_or([]);
+        list.push(i);
+        dict.insert(st.assigned, p, list);
+        dict.insert(st.acc, p, intersect_terms(accumulated(st, p), a.term));
+        if (a.cause < 0) {
+            match (range.floor(term_range(a.term))) {
+                Option.Some(v) => dict.insert(st.decided, p, v),
+                Option.None => { },
+            }
+        }
+        i = i + 1;
+    }
+    // keep the original first-seen order of the packages that survived
+    for p in old_seen {
+        if (dict.has(st.assigned, p)) { st.seen.push(p); }
+    }
+    st.level = level;
+}
+
+// ---------------------------------------------------------------- relation
+
+const SATISFIED: int = 0;
+const ALMOST: int = 1;
+const CONTRADICTED: int = 2;
+const INCONCLUSIVE: int = 3;
+
+/// How the partial solution relates to an incompatibility: (kind, index of the one
+/// unsatisfied term when kind is ALMOST).
+fn relation<P: Hash + Eq, V: Ord>(st: State<P, V>, idx: int) -> (int, int) {
+    let inc = st.incompats[idx];
+    var unsat = -1;
+    var i = 0;
+    while (i < inc.terms.len()) {
+        let t = inc.terms[i];
+        let acc = accumulated(st, term_pkg(t));
+        if (!term_subset(acc, t)) {
+            if (term_disjoint(acc, t)) { return (CONTRADICTED, i); }
+            if (unsat >= 0) { return (INCONCLUSIVE, -1); }
+            unsat = i;
+        }
+        i = i + 1;
+    }
+    if (unsat < 0) { (SATISFIED, -1) } else { (ALMOST, unsat) }
+}
+
+// ---------------------------------------------------------------- propagation
+
+/// Unit propagation from `start`. `Err(idx)` = the root incompatibility of a failure.
+fn propagate<P: Hash + Eq, V: Ord>(st: State<P, V>, start: P) -> Result<int, int> {
+    var changed = [start];
+    while (changed.len() > 0) {
+        let pkg = changed.pop().unwrap();
+        let list = dict.get(st.by_pkg, pkg).unwrap_or([]);
+        var k = list.len() - 1;
+        var restart = false;
+        while (k >= 0 && !restart) {
+            let idx = list[k];
+            let rel = relation(st, idx);
+            if (rel.0 == SATISFIED) {
+                let learned = resolve_conflict(st, idx)?;
+                let rel2 = relation(st, learned);
+                if (rel2.0 != ALMOST) { panic("conflict resolution left an incompatibility that is not almost satisfied"); }
+                let t = st.incompats[learned].terms[rel2.1];
+                derive(st, negate(t), learned);
+                changed = [term_pkg(t)];
+                restart = true;
+            } else if (rel.0 == ALMOST) {
+                let t = st.incompats[idx].terms[rel.1];
+                derive(st, negate(t), idx);
+                let q = term_pkg(t);
+                if (!member(changed, q)) { changed.push(q); }
+            }
+            k = k - 1;
+        }
+    }
+    Result.Ok(0)
+}
+
+/// `xs.contains(x)` for a generic `P: Eq`. The method form compiles on the VM but breaks the
+/// native build (E0369: `==` cannot be applied to type `P`), see the README's findings.
+fn member<P: Eq>(xs: [P], x: P) -> bool {
+    for y in xs {
+        if (y == x) { return true; }
+    }
+    false
+}
+
+fn is_terminal<P: Eq, V>(st: State<P, V>, inc: Incompat<P, V>) -> bool {
+    if (inc.terms.len() == 0) { return true; }
+    if (inc.terms.len() == 1) {
+        let t = inc.terms[0];
+        return is_pos(t) && term_pkg(t) == st.root;
+    }
+    false
+}
+
+/// Index of the first assignment of `p` after which the accumulated term satisfies `t`
+/// (starting from `start`, intersected first), or -1.
+fn satisfier_of<P: Hash + Eq, V: Ord>(st: State<P, V>, t: Term<P, V>, start: Term<P, V>, before: int) -> int {
+    var acc = start;
+    for i in dict.get(st.assigned, term_pkg(t)).unwrap_or([]) {
+        if (i >= before) { return -1; }
+        acc = intersect_terms(acc, st.assigns[i].term);
+        if (term_subset(acc, t)) { return i; }
+    }
+    -1
+}
+
+/// Conflict resolution: walk back from a satisfied incompatibility, combining it with the
+/// causes of its satisfiers until it can be backjumped to. Returns the learned incompatibility.
+fn resolve_conflict<P: Hash + Eq, V: Ord>(st: State<P, V>, conflict: int) -> Result<int, int> {
+    st.stats.conflicts = st.stats.conflicts + 1;
+    var cur = conflict;
+    while (true) {
+        let inc = st.incompats[cur];
+        if (is_terminal(st, inc)) { return Result.Err(cur); }
+        // the satisfier: the latest of the earliest assignments that satisfy each term
+        var sat = -1;
+        var term_i = -1;
+        var i = 0;
+        while (i < inc.terms.len()) {
+            let t = inc.terms[i];
+            let anything: Term<P, V> = any_term(term_pkg(t));
+            let s = satisfier_of(st, t, anything, st.assigns.len());
+            if (s > sat) {
+                sat = s;
+                term_i = i;
+            }
+            i = i + 1;
+        }
+        if (sat < 0) { panic("conflict resolution on an incompatibility that is not satisfied"); }
+        let term = inc.terms[term_i];
+        let satisfier = st.assigns[sat];
+        // the previous satisfier level: what the other terms need, and what `term` needs
+        // besides the satisfier itself
+        var prev = 1;
+        i = 0;
+        while (i < inc.terms.len()) {
+            if (i != term_i) {
+                let t = inc.terms[i];
+                let anything: Term<P, V> = any_term(term_pkg(t));
+                let s = satisfier_of(st, t, anything, st.assigns.len());
+                if (s >= 0 && st.assigns[s].level > prev) { prev = st.assigns[s].level; }
+            }
+            i = i + 1;
+        }
+        let before = satisfier_of(st, term, satisfier.term, sat);
+        if (before >= 0 && st.assigns[before].level > prev) { prev = st.assigns[before].level; }
+
+        if (satisfier.cause < 0 || prev < satisfier.level) {
+            backtrack(st, prev);
+            index_incompat(st, cur);
+            return Result.Ok(cur);
+        }
+        // combine with the satisfier's cause and try again
+        let prior = st.incompats[satisfier.cause];
+        let p = term_pkg(term);
+        var terms: [Term<P, V>] = [];
+        for t in inc.terms {
+            if (term_pkg(t) != p) { terms = merge_term(terms, t); }
+        }
+        for t in prior.terms {
+            if (term_pkg(t) != p) { terms = merge_term(terms, t); }
+        }
+        if (!term_subset(satisfier.term, term)) {
+            let diff = intersect_terms(satisfier.term, negate(term));
+            terms = merge_term(terms, negate(diff));
+        }
+        cur = store_incompat(st, Incompat { terms: terms, cause: Cause.Derived(cur, satisfier.cause) });
+    }
+}
+
+/// Add `t` to a term list, intersecting with the term of the same package if there is one.
+fn merge_term<P: Eq, V: Ord>(terms: [Term<P, V>], t: Term<P, V>) -> [Term<P, V>] {
+    var out: [Term<P, V>] = [];
+    var merged = false;
+    for x in terms {
+        if (term_pkg(x) == term_pkg(t)) {
+            let m = intersect_terms(x, t);
+            if (!is_any(m)) { out.push(m); }
+            merged = true;
+        } else {
+            out.push(x);
+        }
+    }
+    if (!merged && !is_any(t)) { out.push(t); }
+    out
+}
+
+// ---------------------------------------------------------------- decisions
+
+fn versions_of<P: Hash + Eq, V>(st: State<P, V>, p: P) -> Result<[V], string> {
+    match (dict.get(st.versions, p)) {
+        Option.Some(vs) => Result.Ok(vs),
+        Option.None => {
+            let vs = st.provider.versions(p)?;
+            dict.insert(st.versions, p, vs);
+            Result.Ok(vs)
+        },
+    }
+}
+
+/// The best version of a range: the highest release, else the highest pre-release.
+fn pick<V: Ord + Version>(vs: [V], r: Range<V>) -> Option<V> {
+    var best: Option<V> = Option.None;
+    var it = range.in_range(vs, r);
+    var go = true;
+    // `for v in it` crashes on a bounded generic iterator impl (findings), so drive next()
+    while (go) {
+        match (it.next()) {
+            Option.Some(v) => {
+                if (!v.is_prerelease()) {
+                    best = Option.Some(v);
+                } else if (best.is_none()) {
+                    best = Option.Some(v);
+                } else if (best.unwrap().is_prerelease()) {
+                    best = Option.Some(v);
+                }
+            },
+            Option.None => go = false,
+        }
+    }
+    best
+}
+
+fn count_in<V: Ord>(vs: [V], r: Range<V>) -> int { range.in_range(vs, r).collect().len() }
+
+/// The next package to decide: an undecided package with a positive derivation, the one
+/// with the fewest candidate versions first (the likeliest to conflict).
+fn next_package<P: Hash + Eq, V: Ord>(st: State<P, V>) -> Result<Option<P>, string> {
+    var best: Option<P> = Option.None;
+    var best_n = 0;
+    for p in st.seen {
+        if (dict.has(st.decided, p)) { continue; }
+        match (accumulated(st, p)) {
+            Term.Pos(_, r) => {
+                let n = count_in(versions_of(st, p)?, r);
+                if (best.is_none() || n < best_n) {
+                    best = Option.Some(p);
+                    best_n = n;
+                }
+            },
+            Term.Neg(_, _) => { },
+        }
+    }
+    Result.Ok(best)
+}
+
+/// The versions next to `v` (in `vs`) whose dependency on `q` is the same range: one
+/// incompatibility then covers them all ("web >=0.6.0 depends on net ^0.11.0"). The range
+/// is open at the ends of the list, like pub does.
+fn dep_span<P: Hash + Eq, V: Ord + Eq>(st: State<P, V>, p: P, vs: [V], at: int, q: P, r: Range<V>) -> Range<V> {
+    var lo = at;
+    while (lo > 0 && same_dep(st, p, vs[lo - 1], q, r)) { lo = lo - 1; }
+    var hi = at;
+    while (hi + 1 < vs.len() && same_dep(st, p, vs[hi + 1], q, r)) { hi = hi + 1; }
+    let whole: Range<V> = range.full();
+    let low = if (lo == 0) { whole } else { range.at_least(vs[lo]) };
+    let high = if (hi == vs.len() - 1) { whole } else { range.below(vs[hi + 1]) };
+    range.intersect(low, high)
+}
+
+fn same_dep<P: Eq, V: Ord + Eq>(st: State<P, V>, p: P, v: V, q: P, r: Range<V>) -> bool {
+    match (st.provider.deps(p, v)) {
+        Result.Ok(deps) => {
+            for d in deps {
+                if (d.0 == q) { return range.same(d.1, r); }
+            }
+            false
+        },
+        Result.Err(_) => false,
+    }
+}
+
+/// Is version v of p already covered by a dependency incompatibility on q with range r?
+fn has_dep_incompat<P: Hash + Eq, V: Ord + Eq>(st: State<P, V>, p: P, v: V, q: P, r: Range<V>) -> bool {
+    for idx in dict.get(st.by_pkg, p).unwrap_or([]) {
+        let inc = st.incompats[idx];
+        match (inc.cause) {
+            Cause.Dependency => {
+                let a = inc.terms[0];
+                let b = inc.terms[1];
+                if (term_pkg(a) == p && range.contains(term_range(a), v) && term_pkg(b) == q && range.same(term_range(b), r)) {
+                    return true;
+                }
+            },
+            _ => { },
+        }
+    }
+    false
+}
+
+// ---------------------------------------------------------------- solve
+
+pub struct Options { max_steps: int, }
+
+pub fn options() -> Options { Options { max_steps: 1000000 } }
+
+/// Find versions for `root` (at `root_version`) and everything it depends on.
+pub fn solve<P: Hash + Eq + Show, V: Ord + Hash + Eq + Show + Version>(prov: Provider<P, V>, root: P, root_version: V, opts: Options) -> Outcome<P, V> {
+    let incompats: [Incompat<P, V>] = [];
+    let assigns: [Assignment<P, V>] = [];
+    let seen: [P] = [];
+    let by_pkg: Dict<P, [int]> = dict.new();
+    let assigned: Dict<P, [int]> = dict.new();
+    let acc: Dict<P, Term<P, V>> = dict.new();
+    let decided: Dict<P, V> = dict.new();
+    let cache: Dict<P, [V]> = dict.new();
+    let st = State {
+        root: root,
+        provider: prov,
+        incompats: incompats,
+        by_pkg: by_pkg,
+        assigns: assigns,
+        assigned: assigned,
+        acc: acc,
+        decided: decided,
+        seen: seen,
+        level: 0,
+        versions: cache,
+        stats: Stats { decisions: 0, derivations: 0, conflicts: 0, backjumps: 0, incompats: 0 },
+    };
+    add_incompat(st, Incompat { terms: [Term.Neg(root, range.exact(root_version))], cause: Cause.Root });
+    var next = root;
+    var steps = 0;
+    while (true) {
+        steps = steps + 1;
+        if (steps > opts.max_steps) { return Outcome.Error("gave up after ${opts.max_steps} steps"); }
+        match (propagate(st, next)) {
+            Result.Ok(_) => { },
+            Result.Err(idx) => return Outcome.NoSolution(Failure { root: root, incompats: st.incompats, last: idx, stats: st.stats }),
+        }
+        let chosen = match (next_package(st)) {
+            Result.Ok(c) => c,
+            Result.Err(e) => return Outcome.Error(e),
+        };
+        let p = match (chosen) {
+            Option.Some(p) => p,
+            Option.None => {
+                var picks: [(P, V)] = [];
+                for q in st.seen {
+                    match (dict.get(st.decided, q)) {
+                        Option.Some(v) => picks.push((q, v)),
+                        Option.None => { },
+                    }
+                }
+                return Outcome.Solved(Solution { picks: picks, stats: st.stats });
+            },
+        };
+        next = p;
+        let r = term_range(accumulated(st, p));
+        let vs = match (versions_of(st, p)) {
+            Result.Ok(vs) => vs,
+            Result.Err(e) => return Outcome.Error(e),
+        };
+        let v = match (pick(vs, r)) {
+            Option.Some(v) => v,
+            Option.None => {
+                add_incompat(st, Incompat { terms: [Term.Pos(p, r)], cause: Cause.NoVersions });
+                continue;
+            },
+        };
+        let at = match (index_of_version(vs, v)) {
+            Option.Some(i) => i,
+            Option.None => return Outcome.Error("version list of ${p.show()} changed"),
+        };
+        var conflict = false;
+        match (st.provider.deps(p, v)) {
+            Result.Err(msg) => {
+                add_incompat(st, Incompat { terms: [Term.Pos(p, range.exact(v))], cause: Cause.Unavailable(msg) });
+                conflict = true;
+            },
+            Result.Ok(deps) => {
+                for d in deps {
+                    if (d.0 == p) { continue; }
+                    if (has_dep_incompat(st, p, v, d.0, d.1)) { continue; }
+                    let span = dep_span(st, p, vs, at, d.0, d.1);
+                    let idx = add_incompat(st, Incompat { terms: [Term.Pos(p, span), Term.Neg(d.0, d.1)], cause: Cause.Dependency });
+                    // deciding v would satisfy it outright: let propagation rule v out instead
+                    if (term_subset(accumulated(st, d.0), Term.Neg(d.0, d.1))) { conflict = true; }
+                }
+            },
+        }
+        if (!conflict) { decide(st, p, v); }
+    }
+}
+
+fn index_of_version<V: Ord>(vs: [V], v: V) -> Option<int> {
+    var i = 0;
+    while (i < vs.len()) {
+        if (!vs[i].less(v) && !v.less(vs[i])) { return Option.Some(i); }
+        i = i + 1;
+    }
+    Option.None
+}
