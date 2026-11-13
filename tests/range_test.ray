@@ -7,7 +7,9 @@ from range import Range;
 from semver import SemVer;
 
 fn v(s: string) -> SemVer { semver.parse(s).unwrap() }
+
 fn r(s: string) -> Range<SemVer> { req.parse(s).unwrap() }
+
 fn show(x: Range<SemVer>) -> string { range.show_range(x) }
 
 @test

@@ -21,7 +21,9 @@ type Req = Range<SemVer>;
 
 pub fn parse(text: string) -> Result<Req, string> {
     let s = text.trim();
-    if (s.len() == 0) { return Result.Err("empty requirement"); }
+    if (s.len() == 0) {
+        return Result.Err("empty requirement");
+    }
     var out: Req = range.empty();
     for alt in s.split("||") {
         out = range.union(out, parse_conjunction(alt.trim(), text)?);
@@ -30,18 +32,24 @@ pub fn parse(text: string) -> Result<Req, string> {
 }
 
 fn parse_conjunction(s: string, whole: string) -> Result<Req, string> {
-    if (s.len() == 0) { return Result.Err("empty alternative in '${whole}'"); }
+    if (s.len() == 0) {
+        return Result.Err("empty alternative in '${whole}'");
+    }
     var acc: Req = range.full();
     for part in s.split(",") {
         let p = part.trim();
-        if (p.len() == 0) { return Result.Err("empty comparator in '${whole}'"); }
+        if (p.len() == 0) {
+            return Result.Err("empty comparator in '${whole}'");
+        }
         acc = range.intersect(acc, comparator(p, whole)?);
     }
     Result.Ok(acc)
 }
 
 fn comparator(p: string, whole: string) -> Result<Req, string> {
-    if (p == "*") { return Result.Ok(range.full()); }
+    if (p == "*") {
+        return Result.Ok(range.full());
+    }
     for op in [">=", "<=", ">", "<", "=", "^", "~"] {
         match (p.strip_prefix(op)) {
             Option.Some(rest) => return apply(op, partial(rest.trim(), whole)?),
@@ -100,7 +108,9 @@ fn tilde_end(v: Partial) -> SemVer {
 /// `^` keeps the left-most non-zero part: `^1.2.3` <2.0.0, `^0.14` <0.15.0, `^0.0.3` <0.0.4,
 /// `^0.0` <0.1.0, `^0` <1.0.0.
 fn caret_end(v: Partial) -> SemVer {
-    if (v.major > 0) { return semver.new(v.major + 1, 0, 0); }
+    if (v.major > 0) {
+        return semver.new(v.major + 1, 0, 0);
+    }
     match (v.minor) {
         Option.None => semver.new(1, 0, 0),
         Option.Some(mi) => if (mi > 0) {
@@ -115,7 +125,9 @@ fn caret_end(v: Partial) -> SemVer {
 }
 
 fn partial(s: string, whole: string) -> Result<Partial, string> {
-    if (s.len() == 0) { return Result.Err("missing version in '${whole}'"); }
+    if (s.len() == 0) {
+        return Result.Err("missing version in '${whole}'");
+    }
     var core = s;
     var pre = "";
     match (s.index_of("-")) {
@@ -126,16 +138,24 @@ fn partial(s: string, whole: string) -> Result<Partial, string> {
         Option.None => { },
     }
     let parts = core.split(".");
-    if (parts.len() > 3) { return Result.Err("too many parts in '${s}' ('${whole}')"); }
-    if (wild(parts[0])) { return Result.Err("a bare wildcard is written '*' ('${whole}')"); }
+    if (parts.len() > 3) {
+        return Result.Err("too many parts in '${s}' ('${whole}')");
+    }
+    if (wild(parts[0])) {
+        return Result.Err("a bare wildcard is written '*' ('${whole}')");
+    }
     let major = num(parts[0], whole)?;
     var minor: Option<int> = Option.None;
     var patch: Option<int> = Option.None;
     if (parts.len() > 1 && !wild(parts[1])) {
         minor = Option.Some(num(parts[1], whole)?);
-        if (parts.len() > 2 && !wild(parts[2])) { patch = Option.Some(num(parts[2], whole)?); }
+        if (parts.len() > 2 && !wild(parts[2])) {
+            patch = Option.Some(num(parts[2], whole)?);
+        }
     }
-    if (pre != "" && patch.is_none()) { return Result.Err("a pre-release needs MAJOR.MINOR.PATCH ('${whole}')"); }
+    if (pre != "" && patch.is_none()) {
+        return Result.Err("a pre-release needs MAJOR.MINOR.PATCH ('${whole}')");
+    }
     if (pre != "") {
         // validate the tag with the real parser
         semver.parse("0.0.0-" + pre).map_err(fn(e: string) -> string { "${e} ('${whole}')" })?;
@@ -147,7 +167,11 @@ fn wild(s: string) -> bool { s == "x" || s == "X" || s == "*" }
 
 fn num(s: string, whole: string) -> Result<int, string> {
     match (parse_int(s)) {
-        Option.Some(n) => if (n >= 0 && s.len() < 16) { Result.Ok(n) } else { Result.Err("bad number '${s}' in '${whole}'") },
+        Option.Some(n) => if (n >= 0 && s.len() < 16) {
+            Result.Ok(n)
+        } else {
+            Result.Err("bad number '${s}' in '${whole}'")
+        },
         Option.None => Result.Err("bad number '${s}' in '${whole}'"),
     }
 }

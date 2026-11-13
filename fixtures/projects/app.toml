@@ -1,0 +1,14 @@
+# A web service with an agent: every requirement fits together.
+[package]
+name = "app"
+version = "0.1.0"
+
+[dependencies]
+net = "^0.14.0"
+web = "^0.7"
+db = "^0.7.0"
+agent = "^0.2"
+oidc = "~0.3"
+cron = ">=0.1, <0.3"
+elements = "^0.12"
+ui = "path:../ui"

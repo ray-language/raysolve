@@ -1,0 +1,43 @@
+//! The dependency graph of a solution and the paths through it (`raysolve why`).
+
+/// Every simple path from `from` to `target` in a graph of int nodes, depth-first and lazily:
+/// `why` takes the first few without enumerating the rest. A plain (non-generic) user
+/// iterator, so `for`, `take` and `collect` all work on it.
+pub struct Paths {
+    adj: [[int]],
+    target: int,
+    stack: [[int]],
+}
+
+pub fn paths(adj: [[int]], from: int, target: int) -> Paths {
+    Paths { adj: adj, target: target, stack: [[from]] }
+}
+
+impl Iterator<[int]> for Paths {
+    fn next(self) -> Option<[int]> {
+        while (self.stack.len() > 0) {
+            let path = self.stack.pop().unwrap();
+            let last = path[path.len() - 1];
+            if (last == self.target) {
+                return Option.Some(path);
+            }
+            let kids = self.adj[last];
+            var k = kids.len() - 1;
+            // push in reverse so the first child is explored first
+            while (k >= 0) {
+                let c = kids[k];
+                if (!path.contains(c)) {
+                    self.stack.push(path + [c]);
+                }
+                k = k - 1;
+            }
+        }
+        Option.None
+    }
+}
+
+/// Shortest paths first: the same paths, sorted by length (stable, so ties keep DFS order).
+pub fn shortest(adj: [[int]], from: int, target: int, limit: int) -> [[int]] {
+    let all = paths(adj, from, target).take(limit * 8).collect();
+    sort_by(all, fn(a: [int], b: [int]) -> bool { a.len() < b.len() }).slice(0, limit)
+}

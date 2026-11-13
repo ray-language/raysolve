@@ -1,0 +1,8 @@
+# Asking for a pre-release by name lets pre-releases of that package in.
+[package]
+name = "studio"
+version = "0.0.1"
+
+[dependencies]
+elements = "^0.13.0-beta.1"
+net = "*"

@@ -19,6 +19,8 @@ pub trait Version {
 /// which keeps the solver honest about being generic.
 impl Version for int {
     fn is_prerelease(self) -> bool { false }
+
     fn label(self) -> string { to_string(self) }
+
     fn caret_upper(self) -> Option<int> { Option.None }
 }

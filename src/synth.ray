@@ -1,0 +1,151 @@
+//! Synthetic package indexes for stress tests and `raysolve bench`, from a seeded generator
+//! (an own PCG-style LCG on u64, so the VM and the native binary draw the same numbers).
+
+import index;
+import manifest;
+import semver;
+from index import MemSource;
+from manifest import Manifest;
+
+pub struct Rng {
+    state: u64,
+}
+
+pub fn rng(seed: int) -> Rng {
+    var r = Rng { state: (seed as u64) * 2654435761u64 + 1u64 };
+    below(r, 2);
+    r
+}
+
+/// A number in [0, n).
+pub fn below(r: Rng, n: int) -> int {
+    r.state = r.state * 6364136223846793005u64 + 1442695040888963407u64;
+    let x = (r.state >> 33u64) as int;
+    if (n <= 1) { 0 } else { x % n }
+}
+
+pub struct Shape {
+    packages: int,
+    /// versions per package: 1 to this many
+    versions: int,
+    /// dependencies per release: 0 to this many
+    deps: int,
+    /// how far down the package list a dependency may point
+    reach: int,
+    /// direct dependencies of the root
+    roots: int,
+    /// out of 10: how many requirements are exact (`=`) — the knob that makes it hard
+    exact: int,
+    seed: int,
+}
+
+pub fn shape(packages: int, seed: int) -> Shape {
+    Shape { packages: packages, versions: 12, deps: 3, reach: 12, roots: 8, exact: 1, seed: seed }
+}
+
+/// The hard family: a sixth of the packages are direct dependencies, releases depend on up
+/// to three close neighbours, and a fifth of the requirements pin one exact version — tuned
+/// so that about half the indexes have a solution and the rest fail after real search.
+pub fn hard_shape(packages: int, seed: int) -> Shape {
+    Shape {
+        packages: packages,
+        versions: 16,
+        deps: 3,
+        reach: 10,
+        roots: packages / 6,
+        exact: 2,
+        seed: seed
+    }
+}
+
+fn pkg_name(i: int) -> string {
+    if (i < 10) { "p00${i}" } else if (i < 100) { "p0${i}" } else { "p${i}" }
+}
+
+/// Version j of a package: majors 0-2 with four minors each, then patches.
+fn version_text(j: int) -> string {
+    let major = j / 8;
+    let minor = (j % 8) / 2;
+    let patch = j % 2;
+    "${major}.${minor}.${patch}"
+}
+
+/// The requirement a release puts on one of the versions of its dependency.
+fn requirement(r: Rng, target: string, exact: int) -> string {
+    let k = below(r, 10);
+    if (k < exact) {
+        return "=" + target;
+    }
+    let rest = below(r, 4);
+    if (rest < 2) { "^" + target } else if (rest < 3) { "~" + target } else { ">=" + target }
+}
+
+/// A random index over `shape` (dependencies only point further down the list, so there
+/// are no cycles) and the manifest of a project that depends on its first packages.
+pub fn random_index(sh: Shape) -> (MemSource, Manifest) {
+    var r = rng(sh.seed);
+    let m = index.mem_source("${sh.packages} packages, seed ${sh.seed}");
+    var counts: [int] = [];
+    var i = 0;
+    while (i < sh.packages) {
+        counts.push(1 + below(r, sh.versions));
+        i = i + 1;
+    }
+    i = 0;
+    while (i < sh.packages) {
+        var j = 0;
+        while (j < counts[i]) {
+            var deps: [(string, string)] = [];
+            var seen: [int] = [];
+            let nd = below(r, sh.deps + 1);
+            var d = 0;
+            while (d < nd && i + 1 < sh.packages) {
+                let span = if (sh.packages - i - 1 < sh.reach) {
+                    sh.packages - i - 1
+                } else {
+                    sh.reach
+                };
+                let t = i + 1 + below(r, span);
+                if (!seen.contains(t)) {
+                    seen.push(t);
+                    deps.push(
+                        (pkg_name(t), requirement(r, version_text(below(r, counts[t])), sh.exact))
+                    );
+                }
+                d = d + 1;
+            }
+            index.add(m, pkg_name(i), version_text(j), deps);
+            j = j + 1;
+        }
+        i = i + 1;
+    }
+    var root_deps: [(string, string)] = [];
+    i = 0;
+    while (i < sh.roots && i < sh.packages) {
+        root_deps.push((pkg_name(i), "*"));
+        i = i + 1;
+    }
+    let ext: [(string, string)] = [];
+    let man = Manifest {
+        name: "bench",
+        version: semver.new(1, 0, 0),
+        deps: root_deps,
+        external: ext
+    };
+    (m, man)
+}
+
+/// The project manifest as ray.toml text (what `raysolve gen` writes next to the index).
+pub fn manifest_toml(m: Manifest) -> string {
+    var lines = [
+        "[package]",
+        "name = \"${m.name}\"",
+        "version = \"${semver.text_of(m.version)}\"",
+        "",
+        "[dependencies]"
+    ];
+    for d in m.deps {
+        lines.push("${d.0} = \"${d.1}\"");
+    }
+    lines.join("\n") + "\n"
+}

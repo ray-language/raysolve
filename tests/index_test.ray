@@ -1,0 +1,91 @@
+// Package sources behind `dyn Source`, the JSON package format and ray.toml manifests.
+
+import std/json;
+import index;
+import manifest;
+import semver;
+from index import Release, Source;
+
+fn labels(rs: [Release]) -> [string] {
+    sort(rs.map(fn(r: Release) -> string { semver.text_of(r.version) }))
+}
+
+@test
+fn dir_source_reads_package_files() {
+    let d = index.dir_source("fixtures/ecosystem");
+    let s: dyn Source = d;
+    let web = s.releases("web").unwrap();
+    assert_eq(web.len(), 7);
+    assert(labels(web).contains("0.7.1"));
+    var yanked = 0;
+    for r in web {
+        if (r.yanked) {
+            yanked = yanked + 1;
+        }
+    }
+    assert_eq(yanked, 1);
+    assert_eq(s.releases("nonexistent").unwrap().len(), 0);
+    assert_eq(s.names().unwrap().len(), 12);
+    assert_eq(s.origin(), "dir fixtures/ecosystem");
+}
+
+@test
+fn file_source_matches_dir_source() {
+    let f = index.file_source("fixtures/ecosystem.json");
+    let d = index.dir_source("fixtures/ecosystem");
+    let a: dyn Source = f;
+    let b: dyn Source = d;
+    assert_eq(a.names().unwrap(), b.names().unwrap());
+    for n in a.names().unwrap() {
+        assert_eq(labels(a.releases(n).unwrap()), labels(b.releases(n).unwrap()));
+    }
+}
+
+@test
+fn layers_answer_in_order() {
+    let top = index.mem_source("top");
+    index.add(top, "net", "9.0.0", []);
+    let dir = index.dir_source("fixtures/ecosystem");
+    let x: dyn Source = top;
+    let y: dyn Source = dir;
+    let l = index.Layered { layers: [x, y] };
+    let s: dyn Source = l;
+    assert_eq(labels(s.releases("net").unwrap()), ["9.0.0"]);
+    assert_eq(s.releases("web").unwrap().len(), 7);
+    assert_eq(s.origin(), "memory top + dir fixtures/ecosystem");
+    assert_eq(s.names().unwrap().len(), 12);
+}
+
+@test
+fn render_and_parse_round_trip() {
+    let rels = index.dir_source("fixtures/ecosystem").releases("agent").unwrap();
+    let text = index.render_package("agent", rels);
+    let back = index.parse_package("agent", json.parse(text).unwrap()).unwrap();
+    assert_eq(labels(back), labels(rels));
+    assert(text.contains("\"llm\": \"^0.2.1\""));
+}
+
+@test
+fn bad_package_files_say_where() {
+    let bad = json.parse(`{"versions": {"1.0": {}}}`).unwrap();
+    let e = index.parse_package("x", bad);
+    assert(e.is_err());
+    match (e) {
+        Result.Err(msg) => assert(msg.contains("package 'x'")),
+        Result.Ok(_) => assert(false),
+    }
+    assert(index.parse_package("x", json.parse(`{}`).unwrap()).is_err());
+    assert(index.open("fixtures/does-not-exist").is_err());
+}
+
+@test
+fn manifest_reads_dependencies() {
+    let m = manifest.load("fixtures/projects/app.toml").unwrap();
+    assert_eq(m.name, "app");
+    assert_eq(semver.text_of(m.version), "0.1.0");
+    assert_eq(m.deps.len(), 7);
+    assert_eq(m.deps[0], ("net", "^0.14.0"));
+    assert_eq(m.external, [("ui", "path:../ui")]);
+    assert(manifest.parse("[dependencies]\nnet = 3\n").is_err());
+    assert_eq(manifest.parse("[dependencies]\n").unwrap().name, "root");
+}

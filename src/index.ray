@@ -1,0 +1,265 @@
+//! Where package versions come from: a `Source` trait and its implementations, used as
+//! `dyn Source` so the CLI can stack them (`--index a --index b`).
+//!
+//!   DirSource    a directory with one `<name>.json` per package (read lazily, cached)
+//!   FileSource   one `index.json` with every package under "packages"
+//!   MemSource    built in code (tests, the synthetic benchmark indexes)
+//!   Layered      several sources; the first one that knows a package answers for it
+//!
+//! A package file:
+//!
+//!   { "name": "web",
+//!     "versions": { "0.7.0": { "deps": { "net": "^0.14.0" } },
+//!                   "0.7.1": { "deps": { "net": "^0.14.0" }, "yanked": true } } }
+
+import std/fs;
+import std/json;
+import std/sort;
+import semver;
+from std/json import Json;
+from semver import SemVer;
+
+pub struct Release {
+    version: SemVer,
+    /// (package, requirement text) in file order
+    deps: [(string, string)],
+    yanked: bool,
+}
+
+pub trait Source {
+    /// What this source is, for messages: `dir fixtures/ecosystem`.
+    fn origin(self) -> string;
+    /// Every release of a package, in no particular order; `[]` when the source does not know it.
+    fn releases(self, name: string) -> Result<[Release], string>;
+    /// Every package name the source knows, sorted.
+    fn names(self) -> Result<[string], string>;
+}
+
+// ---------------------------------------------------------------- JSON
+
+/// The "versions" object of a package (from a package file or an index file).
+pub fn parse_package(name: string, pkg: Json) -> Result<[Release], string> {
+    let versions = match (json.get_object(pkg, "versions")) {
+        Option.Some(m) => m,
+        Option.None => return Result.Err("package '${name}': missing \"versions\" object"),
+    };
+    var out: [Release] = [];
+    for (text, body) in versions {
+        let v = semver.parse(text).map_err(fn(e: string) -> string { "package '${name}': ${e}" })?;
+        var deps: [(string, string)] = [];
+        match (json.get_object(body, "deps")) {
+            Option.Some(m) => {
+                for (dep, req) in m {
+                    match (json.as_string(req)) {
+                        Option.Some(r) => deps.push((dep, r)),
+                        Option.None => return Result.Err(
+                            "package '${name}' ${text}: requirement of '${dep}' is not a string"
+                        ),
+                    }
+                }
+            },
+            Option.None => { },
+        }
+        let yanked = json.get_bool(body, "yanked").unwrap_or(false);
+        out.push(Release { version: v, deps: deps, yanked: yanked });
+    }
+    Result.Ok(out)
+}
+
+/// The same package back as JSON (the generator writes indexes with it).
+pub fn render_package(name: string, rels: [Release]) -> string {
+    var versions: Map<string, Json> = Map.new();
+    for r in rels {
+        var deps: Map<string, Json> = Map.new();
+        for d in r.deps {
+            deps.insert(d.0, Json.JStr(d.1));
+        }
+        var body: Map<string, Json> = Map.new();
+        body.insert("deps", Json.JObject(deps));
+        if (r.yanked) {
+            body.insert("yanked", Json.JBool(true));
+        }
+        versions.insert(semver.text_of(r.version), Json.JObject(body));
+    }
+    var top: Map<string, Json> = Map.new();
+    top.insert("name", Json.JStr(name));
+    top.insert("versions", Json.JObject(versions));
+    json.stringify_pretty(Json.JObject(top), 2)
+}
+
+// ---------------------------------------------------------------- directory
+
+pub struct DirSource {
+    dir: string,
+    cache: Map<string, [Release]>,
+}
+
+pub fn dir_source(dir: string) -> DirSource {
+    let cache: Map<string, [Release]> = Map.new();
+    DirSource { dir: dir, cache: cache }
+}
+
+impl Source for DirSource {
+    fn origin(self) -> string { "dir ${self.dir}" }
+
+    fn releases(self, name: string) -> Result<[Release], string> {
+        match (self.cache.get(name)) {
+            Option.Some(rs) => return Result.Ok(rs),
+            Option.None => { },
+        }
+        let path = "${self.dir}/${name}.json";
+        let rels: [Release] = if (!fs.exists(path)) {
+            []
+        } else {
+            let text = fs.read_file(path)?;
+            let doc = json.parse(text).map_err(fn(e: string) -> string { "${path}: ${e}" })?;
+            parse_package(name, doc).map_err(fn(e: string) -> string { "${path}: ${e}" })?
+        };
+        self.cache.insert(name, rels);
+        Result.Ok(rels)
+    }
+
+    fn names(self) -> Result<[string], string> {
+        var out: [string] = [];
+        for f in fs.list_dir(self.dir)? {
+            match (f.strip_suffix(".json")) {
+                Option.Some(n) => out.push(n),
+                Option.None => { },
+            }
+        }
+        Result.Ok(sort(out))
+    }
+}
+
+// ---------------------------------------------------------------- single file
+
+pub struct FileSource {
+    path: string,
+    loaded: bool,
+    pkgs: Map<string, [Release]>,
+}
+
+pub fn file_source(path: string) -> FileSource {
+    let pkgs: Map<string, [Release]> = Map.new();
+    FileSource { path: path, loaded: false, pkgs: pkgs }
+}
+
+fn load_file(s: FileSource) -> Result<int, string> {
+    if (s.loaded) {
+        return Result.Ok(s.pkgs.len());
+    }
+    let text = fs.read_file(s.path)?;
+    let doc = json.parse(text).map_err(fn(e: string) -> string { "${s.path}: ${e}" })?;
+    let pkgs = match (json.get_object(doc, "packages")) {
+        Option.Some(m) => m,
+        Option.None => return Result.Err("${s.path}: missing \"packages\" object"),
+    };
+    for (name, body) in pkgs {
+        s.pkgs.insert(
+            name,
+            parse_package(name, body).map_err(fn(e: string) -> string { "${s.path}: ${e}" })?
+        );
+    }
+    s.loaded = true;
+    Result.Ok(s.pkgs.len())
+}
+
+impl Source for FileSource {
+    fn origin(self) -> string { "file ${self.path}" }
+
+    fn releases(self, name: string) -> Result<[Release], string> {
+        load_file(self)?;
+        Result.Ok(self.pkgs.get_or(name, []))
+    }
+
+    fn names(self) -> Result<[string], string> {
+        load_file(self)?;
+        Result.Ok(self.pkgs.keys())
+    }
+}
+
+// ---------------------------------------------------------------- memory
+
+pub struct MemSource {
+    label: string,
+    pkgs: Map<string, [Release]>,
+}
+
+pub fn mem_source(label: string) -> MemSource {
+    let pkgs: Map<string, [Release]> = Map.new();
+    MemSource { label: label, pkgs: pkgs }
+}
+
+/// Add one release: `add(m, "web", "0.7.0", [("net", "^0.14.0")])`.
+pub fn add(m: MemSource, name: string, version: string, deps: [(string, string)]) {
+    var rs = m.pkgs.get_or(name, []);
+    rs.push(Release { version: semver.parse(version).unwrap(), deps: deps, yanked: false });
+    m.pkgs.insert(name, rs);
+}
+
+pub fn add_release(m: MemSource, name: string, r: Release) {
+    var rs = m.pkgs.get_or(name, []);
+    rs.push(r);
+    m.pkgs.insert(name, rs);
+}
+
+impl Source for MemSource {
+    fn origin(self) -> string { "memory ${self.label}" }
+
+    fn releases(self, name: string) -> Result<[Release], string> { Result.Ok(self.pkgs.get_or(name, [])) }
+
+    fn names(self) -> Result<[string], string> { Result.Ok(self.pkgs.keys()) }
+}
+
+// ---------------------------------------------------------------- layers
+
+pub struct Layered {
+    layers: [dyn Source],
+}
+
+impl Source for Layered {
+    fn origin(self) -> string {
+        var parts: [string] = [];
+        for l in self.layers {
+            parts.push(l.origin());
+        }
+        parts.join(" + ")
+    }
+
+    fn releases(self, name: string) -> Result<[Release], string> {
+        for l in self.layers {
+            let rs = l.releases(name)?;
+            if (rs.len() > 0) {
+                return Result.Ok(rs);
+            }
+        }
+        Result.Ok([])
+    }
+
+    fn names(self) -> Result<[string], string> {
+        var all: [string] = [];
+        for l in self.layers {
+            all = all + l.names()?;
+        }
+        Result.Ok(sort.dedup(sort(all)))
+    }
+}
+
+/// A directory becomes a DirSource, anything else a FileSource.
+///
+/// The concrete value is bound before it becomes a `dyn Source`: coercing a CALL result
+/// (`let s: dyn Source = dir_source(p)`) crashes the VM and is rejected by the native
+/// backend (README findings).
+pub fn open(path: string) -> Result<dyn Source, string> {
+    if (fs.is_dir(path)) {
+        let d = dir_source(path);
+        let s: dyn Source = d;
+        return Result.Ok(s);
+    }
+    if (fs.exists(path)) {
+        let f = file_source(path);
+        let s: dyn Source = f;
+        return Result.Ok(s);
+    }
+    Result.Err("index not found: ${path}")
+}

@@ -1,0 +1,8 @@
+# A package that is not in the index at all.
+[package]
+name = "ghosts"
+version = "0.1.0"
+
+[dependencies]
+web = "^0.7"
+spectre = "^1.0"

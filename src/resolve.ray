@@ -1,0 +1,155 @@
+//! The bridge between a `dyn Source` (releases with requirement TEXT) and the generic solver
+//! (versions and `Range<SemVer>`): filtering yanked and pre-release versions, parsing
+//! requirements once per release, and the root package made of the manifest.
+
+import std/collections/dict;
+import std/collections/set;
+import std/time;
+import index;
+import manifest;
+import pubgrub;
+import range;
+import req;
+import semver;
+from std/collections/dict import Dict;
+from std/collections/set import Set;
+from index import Release, Source;
+from manifest import Manifest;
+from pubgrub import Dep, Outcome, Provider;
+from range import Range;
+from semver import SemVer;
+
+/// A release of a package: the key of the parsed-dependency cache.
+@derive(Eq, Hash, Show)
+pub struct PkgVer {
+    name: string,
+    version: SemVer,
+}
+
+pub struct Settings {
+    /// consider pre-releases of every package (otherwise only of the packages whose
+    /// requirement in the manifest names a pre-release)
+    pre: bool,
+    /// consider yanked releases too
+    yanked: bool,
+}
+
+pub fn settings() -> Settings { Settings { pre: false, yanked: false } }
+
+/// The solver's view of a source for one manifest. The closures share the caches.
+pub fn provider(src: dyn Source, m: Manifest, s: Settings) -> Provider<string, SemVer> {
+    let parsed: Dict<PkgVer, Result<[Dep<string, SemVer>], string>> = dict.new();
+    let listed: Map<string, [Release]> = Map.new();
+    // packages whose pre-releases may be picked
+    let pre_ok: Set<string> = set.new();
+    for d in m.deps {
+        if (d.1.contains("-")) {
+            set.add(pre_ok, d.0);
+        }
+    }
+    Provider {
+        versions: fn(p: string) -> Result<[SemVer], string> {
+            if (p == m.name) {
+                return Result.Ok([m.version]);
+            }
+            let rels = releases_of(src, listed, p)?;
+            var vs: [SemVer] = [];
+            for r in rels {
+                if (r.yanked && !s.yanked) {
+                    continue;
+                }
+                if (r.version.pre != "" && !s.pre && !set.has(pre_ok, p)) {
+                    continue;
+                }
+                vs.push(r.version);
+            }
+            Result.Ok(sort(vs))
+        },
+        deps: fn(p: string, v: SemVer) -> Result<[Dep<string, SemVer>], string> {
+            let key = PkgVer { name: p, version: v };
+            match (dict.get(parsed, key)) {
+                Option.Some(r) => return r,
+                Option.None => { },
+            }
+            let texts: [(string, string)] = if (p == m.name) {
+                m.deps
+            } else {
+                match (find_release(src, listed, p, v)) {
+                    Result.Ok(r) => r.deps,
+                    Result.Err(e) => return Result.Err(e),
+                }
+            };
+            var out: [Dep<string, SemVer>] = [];
+            var err = "";
+            for d in texts {
+                match (req.parse(d.1)) {
+                    Result.Ok(r) => out.push((d.0, r)),
+                    Result.Err(e) => if (err == "") {
+                        err = "bad requirement for ${d.0}: ${e}";
+                    },
+                }
+            }
+            let res: Result<[Dep<string, SemVer>], string> = if (err == "") {
+                Result.Ok(out)
+            } else {
+                Result.Err(err)
+            };
+            dict.insert(parsed, key, res);
+            res
+        }
+    }
+}
+
+fn releases_of(
+    src: dyn Source,
+    listed: Map<string, [Release]>,
+    p: string
+) -> Result<[Release], string> {
+    match (listed.get(p)) {
+        Option.Some(rs) => Result.Ok(rs),
+        Option.None => {
+            let rs = src.releases(p)?;
+            listed.insert(p, rs);
+            Result.Ok(rs)
+        },
+    }
+}
+
+fn find_release(
+    src: dyn Source,
+    listed: Map<string, [Release]>,
+    p: string,
+    v: SemVer
+) -> Result<Release, string> {
+    for r in releases_of(src, listed, p)? {
+        if (r.version == v) {
+            return Result.Ok(r);
+        }
+    }
+    Result.Err("${p} ${semver.text_of(v)} is not in the index")
+}
+
+pub struct Run {
+    outcome: Outcome<string, SemVer>,
+    micros: int,
+}
+
+/// Solve a manifest against a source, timed.
+pub fn run(src: dyn Source, m: Manifest, s: Settings) -> Run {
+    let prov = provider(src, m, s);
+    let t0 = time.monotonic_nanos();
+    let o = pubgrub.solve(prov, m.name, m.version, pubgrub.options());
+    let t1 = time.monotonic_nanos();
+    Run { outcome: o, micros: (t1 - t0) / 1000 }
+}
+
+/// The resolved packages without the root, sorted by name.
+pub fn lock(m: Manifest, picks: [(string, SemVer)]) -> [(string, SemVer)] {
+    var out: [(string, SemVer)] = [];
+    for p in picks {
+        if (p.0 != m.name) {
+            out.push(p);
+        }
+    }
+    sort_by(out, fn(a: (string, SemVer), b: (string, SemVer)) -> bool { a.0 < b.0 })
+}

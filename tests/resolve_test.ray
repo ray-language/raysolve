@@ -1,0 +1,147 @@
+// End to end over the ecosystem fixture: locks, explanations, policies, paths, generator.
+
+import explain;
+import graph;
+import index;
+import manifest;
+import pubgrub;
+import resolve;
+import semver;
+import synth;
+from index import Source;
+from pubgrub import Outcome;
+
+fn solve_project(name: string, s: resolve.Settings) -> Outcome<string, semver.SemVer> {
+    let m = manifest.load("fixtures/projects/${name}.toml").unwrap();
+    let d = index.dir_source("fixtures/ecosystem");
+    let src: dyn Source = d;
+    resolve.run(src, m, s).outcome
+}
+
+fn lock_text(name: string, s: resolve.Settings) -> string {
+    let m = manifest.load("fixtures/projects/${name}.toml").unwrap();
+    match (solve_project(name, s)) {
+        Outcome.Solved(sol) => {
+            var parts: [string] = [];
+            for p in resolve.lock(m, sol.picks) {
+                parts.push("${p.0}=${semver.text_of(p.1)}");
+            }
+            parts.join(" ")
+        },
+        Outcome.NoSolution(f) => "FAIL " + explain_of(f),
+        Outcome.Error(e) => "ERROR " + e,
+    }
+}
+
+fn explain_of(f: pubgrub.Failure<string, semver.SemVer>) -> string {
+    explain.explain(f)
+}
+
+@test
+fn app_locks_the_newest_compatible_set() {
+    assert_eq(
+        lock_text("app", resolve.settings()),
+        "agent=0.2.1 cron=0.2.1 db=0.7.2 elements=0.12.0 llm=0.2.1 mcp=0.3.1 net=0.14.1 oidc=0.3.0 tz=0.2.0 web=0.7.0 yaml=0.1.1"
+    );
+}
+
+@test
+fn yanked_releases_only_on_request() {
+    var s = resolve.settings();
+    s.yanked = true;
+    assert(lock_text("app", s).contains("web=0.7.1"));
+}
+
+@test
+fn prereleases_by_name_or_by_flag() {
+    assert_eq(lock_text("pre", resolve.settings()), "elements=0.13.0-beta.1 net=0.15.0");
+    // --pre lets every pre-release in, but a release still wins over a pre-release
+    var s = resolve.settings();
+    s.pre = true;
+    assert_eq(lock_text("pre", s), "elements=0.13.0-beta.1 net=0.15.0");
+}
+
+@test
+fn conflict_is_explained_like_pub() {
+    assert_eq(
+        lock_text("conflict", resolve.settings()),
+        `FAIL Because web ^0.6.0 depends on net ^0.13.0 and legacy depends on web ^0.6.0, legacy requires net ^0.13.0.
+So, because legacy depends on net ^0.14.0, version solving failed.`
+    );
+}
+
+@test
+fn two_hop_conflict() {
+    assert_eq(
+        lock_text("deep", resolve.settings()),
+        `FAIL Because agent <0.2.0 depends on mcp ^0.2.0 and mcp <0.3.0 depends on net ^0.13.0, agent <0.2.0 requires net ^0.13.0.
+And because bot depends on agent ^0.1.0, bot requires net ^0.13.0.
+So, because bot depends on net ^0.14.0, version solving failed.`
+    );
+}
+
+@test
+fn missing_package() {
+    assert_eq(
+        lock_text("missing", resolve.settings()),
+        "FAIL Because no versions of spectre match ^1.0.0 and ghosts depends on spectre ^1.0.0, version solving failed."
+    );
+}
+
+@test
+fn paths_iterate_lazily() {
+    // 0 -> 1 -> 3, 0 -> 2 -> 3, 0 -> 3
+    let adj: [[int]] = [[1, 2, 3], [3], [3], []];
+    var seen: [[int]] = [];
+    for p in graph.paths(adj, 0, 3) {
+        seen.push(p);
+    }
+    assert_eq(seen, [[0, 1, 3], [0, 2, 3], [0, 3]]);
+    assert_eq(graph.paths(adj, 0, 3).take(1).collect(), [[0, 1, 3]]);
+    assert_eq(graph.shortest(adj, 0, 3, 2), [[0, 3], [0, 1, 3]]);
+    assert_eq(graph.paths(adj, 3, 0).collect().len(), 0);
+}
+
+@test
+fn generator_is_deterministic() {
+    let a = synth.random_index(synth.shape(60, 7));
+    let b = synth.random_index(synth.shape(60, 7));
+    let c = synth.random_index(synth.shape(60, 8));
+    let ma = a.0;
+    let mb = b.0;
+    let mc = c.0;
+    assert_eq(ma.pkgs.keys(), mb.pkgs.keys());
+    var same = true;
+    var differs = false;
+    for n in ma.pkgs.keys() {
+        let ra = index.render_package(n, ma.pkgs.get(n).unwrap());
+        if (ra != index.render_package(n, mb.pkgs.get(n).unwrap())) {
+            same = false;
+        }
+        if (ra != index.render_package(n, mc.pkgs.get_or(n, []))) {
+            differs = true;
+        }
+    }
+    assert(same);
+    assert(differs);
+}
+
+@test
+fn generated_indexes_solve_the_same_on_every_run() {
+    let built = synth.random_index(synth.hard_shape(100, 2));
+    let mem = built.0;
+    let src: dyn Source = mem;
+    let one = resolve.run(src, built.1, resolve.settings()).outcome;
+    let two = resolve.run(src, built.1, resolve.settings()).outcome;
+    match (one) {
+        Outcome.Solved(a) => match (two) {
+            Outcome.Solved(b) => {
+                assert_eq(a.stats.decisions, b.stats.decisions);
+                assert_eq(a.picks.len(), b.picks.len());
+                assert_eq(a.stats.decisions, 151);
+            },
+            _ => assert(false),
+        },
+        _ => assert(false),
+    }
+}

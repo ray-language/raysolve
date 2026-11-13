@@ -1,0 +1,497 @@
+//! raysolve: resolve the [dependencies] of a ray.toml against a package index with PubGrub,
+//! and explain in plain words why it cannot be done when it cannot.
+//!
+//!   raysolve resolve fixtures/projects/app.toml --index fixtures/ecosystem
+//!   raysolve why net fixtures/projects/app.toml --index fixtures/ecosystem
+//!   raysolve outdated fixtures/projects/app.toml --index fixtures/ecosystem
+//!   raysolve bench --packages 300
+
+import std/fs;
+import std/json;
+import std/sort;
+import std/time;
+import explain;
+import graph;
+import index;
+import manifest;
+import pubgrub;
+import range;
+import req;
+import resolve;
+import semver;
+import synth;
+from std/json import Json;
+from index import Source;
+from manifest import Manifest;
+from pubgrub import Failure, Outcome, Stats;
+from semver import SemVer;
+
+const VERSION: string = "0.1.0";
+
+const USAGE: string = `usage: raysolve <command> [ray.toml] [options]
+
+commands:
+  resolve [ray.toml]        solve the dependencies and print the lock (exit 1 = no solution)
+  why PKG [ray.toml]        how the solution reaches PKG, path by path
+  outdated [ray.toml]       per direct dependency: locked, newest compatible, newest
+  bench                     solve generated indexes and time them
+  gen DIR                   write a generated index (one JSON per package) + DIR/ray.toml
+  help | version
+
+options:
+  --index PATH   a directory of <package>.json or an index.json; repeat to layer them
+                 (the first that knows a package wins); default: $RAYSOLVE_INDEX
+  --pre          consider pre-releases of every package
+  --yanked       consider yanked releases
+  --json         resolve: print the lock as JSON
+  --tree         resolve: on failure, also print the derivation tree
+  --packages N   bench/gen: packages in the generated index (default 200)
+  --seed N       bench/gen: generator seed (default 1)
+  --rounds N     bench: solves per index (default 3)
+`;
+
+struct Args {
+    command: string,
+    positional: [string],
+    indexes: [string],
+    pre: bool,
+    yanked: bool,
+    as_json: bool,
+    tree: bool,
+    packages: int,
+    seed: int,
+    rounds: int,
+}
+
+fn parse_args(argv: [string]) -> Result<Args, string> {
+    var a = Args {
+        command: "",
+        positional: [],
+        indexes: [],
+        pre: false,
+        yanked: false,
+        as_json: false,
+        tree: false,
+        packages: 200,
+        seed: 1,
+        rounds: 3
+    };
+    var i = 0;
+    while (i < argv.len()) {
+        let x = argv[i];
+        if (x == "--index" || x == "--packages" || x == "--seed" || x == "--rounds") {
+            if (i + 1 >= argv.len()) {
+                return Result.Err("${x} needs a value");
+            }
+            let v = argv[i + 1];
+            i = i + 1;
+            if (x == "--index") {
+                a.indexes.push(v);
+            } else {
+                let n = match (parse_int(v)) {
+                    Option.Some(n) => n,
+                    Option.None => return Result.Err("${x} expects a number, got '${v}'"),
+                };
+                if (n < 1) {
+                    return Result.Err("${x} must be at least 1");
+                }
+                if (x == "--packages") {
+                    a.packages = n;
+                } else if (x == "--seed") {
+                    a.seed = n;
+                } else {
+                    a.rounds = n;
+                }
+            }
+        } else if (x == "--pre") {
+            a.pre = true;
+        } else if (x == "--yanked") {
+            a.yanked = true;
+        } else if (x == "--json") {
+            a.as_json = true;
+        } else if (x == "--tree") {
+            a.tree = true;
+        } else if (x.starts_with("--")) {
+            return Result.Err("unknown option ${x}");
+        } else if (a.command == "") {
+            a.command = x;
+        } else {
+            a.positional.push(x);
+        }
+        i = i + 1;
+    }
+    Result.Ok(a)
+}
+
+fn open_source(a: Args) -> Result<dyn Source, string> {
+    var paths = a.indexes;
+    if (paths.len() == 0) {
+        match (env("RAYSOLVE_INDEX")) {
+            Option.Some(p) => paths = [p],
+            Option.None => return Result.Err("no index: pass --index PATH or set RAYSOLVE_INDEX"),
+        }
+    }
+    if (paths.len() == 1) {
+        return index.open(paths[0]);
+    }
+    var layers: [dyn Source] = [];
+    for p in paths {
+        layers.push(index.open(p)?);
+    }
+    let stack = index.Layered { layers: layers };
+    let s: dyn Source = stack;
+    Result.Ok(s)
+}
+
+fn settings_of(a: Args) -> resolve.Settings {
+    var s = resolve.settings();
+    s.pre = a.pre;
+    s.yanked = a.yanked;
+    s
+}
+
+fn manifest_path(a: Args, at: int) -> string {
+    if (a.positional.len() > at) { a.positional[at] } else { "ray.toml" }
+}
+
+fn ms(micros: int) -> string {
+    let whole = micros / 1000;
+    let frac = (micros % 1000) / 10;
+    if (frac < 10) { "${whole}.0${frac} ms" } else { "${whole}.${frac} ms" }
+}
+
+fn stats_line(s: Stats) -> string {
+    "${s.decisions} decisions, ${s.derivations} derivations, ${s.conflicts} conflicts, ${s.incompats} incompatibilities"
+}
+
+fn pad(s: string, w: int) -> string { s + " ".repeat(w - s.len()) }
+
+// ---------------------------------------------------------------- resolve
+
+fn cmd_resolve(a: Args) -> Result<int, string> {
+    let m = manifest.load(manifest_path(a, 0))?;
+    let src = open_source(a)?;
+    let run = resolve.run(src, m, settings_of(a));
+    match (run.outcome) {
+        Outcome.Solved(sol) => {
+            let lock = resolve.lock(m, sol.picks);
+            if (a.as_json) {
+                var pkgs: Map<string, Json> = Map.new();
+                for p in lock {
+                    pkgs.insert(p.0, Json.JStr(semver.text_of(p.1)));
+                }
+                let out = json.obj()
+                    .field("package", m.name)
+                    .field("packages", Json.JObject(pkgs))
+                    .field("decisions", sol.stats.decisions)
+                    .field("conflicts", sol.stats.conflicts)
+                    .field("micros", run.micros);
+                print(out.render());
+                return Result.Ok(0);
+            }
+            print(
+                "# ${m.name} ${semver.text_of(m.version)}: ${lock.len()} packages in ${ms(run.micros)} (${stats_line(sol.stats)})"
+            );
+            var width = 0;
+            for p in lock {
+                if (p.0.len() > width) {
+                    width = p.0.len();
+                }
+            }
+            for p in lock {
+                print("${pad(p.0, width)} = \"${semver.text_of(p.1)}\"");
+            }
+            for e in m.external {
+                print("# not from the index: ${e.0} = \"${e.1}\"");
+            }
+            Result.Ok(0)
+        },
+        Outcome.NoSolution(f) => {
+            print(explain.explain(f));
+            if (a.tree) {
+                print("");
+                print("derivation tree:");
+                print(explain.tree(f));
+            }
+            eprint(
+                "raysolve: no solution for ${m.name} (${stats_line(f.stats)}, ${ms(run.micros)})"
+            );
+            Result.Ok(1)
+        },
+        Outcome.Error(e) => Result.Err(e),
+    }
+}
+
+// ---------------------------------------------------------------- why
+
+fn cmd_why(a: Args) -> Result<int, string> {
+    if (a.positional.len() == 0) {
+        return Result.Err("why: which package?");
+    }
+    let target = a.positional[0];
+    let m = manifest.load(manifest_path(a, 1))?;
+    let src = open_source(a)?;
+    let s = settings_of(a);
+    let run = resolve.run(src, m, s);
+    let sol = match (run.outcome) {
+        Outcome.Solved(sol) => sol,
+        Outcome.NoSolution(f) => {
+            print("there is no solution, so nothing depends on ${target} yet:");
+            print(explain.explain(f));
+            return Result.Ok(1);
+        },
+        Outcome.Error(e) => return Result.Err(e),
+    };
+    // nodes = picks; edges from the dependencies of each picked release
+    let prov = resolve.provider(src, m, s);
+    var at: Map<string, int> = Map.new();
+    var i = 0;
+    while (i < sol.picks.len()) {
+        at.insert(sol.picks[i].0, i);
+        i = i + 1;
+    }
+    let goal = match (at.get(target)) {
+        Option.Some(g) => g,
+        Option.None => {
+            print("${target} is not in the solution of ${m.name}");
+            return Result.Ok(1);
+        },
+    };
+    var adj: [[int]] = [];
+    var reqs: Map<string, string> = Map.new();
+    for p in sol.picks {
+        var kids: [int] = [];
+        for d in prov.deps(p.0, p.1)? {
+            // typed lets: the native backend loses the type of `d.0` in "${d.0}" here
+            let from_name: string = p.0;
+            let to_name: string = d.0;
+            match (at.get(to_name)) {
+                Option.Some(k) => {
+                    kids.push(k);
+                    reqs.insert("${from_name}>${to_name}", range.show_range(d.1));
+                },
+                Option.None => { },
+            }
+        }
+        adj.push(kids);
+    }
+    let root = at.get(m.name).unwrap();
+    let found = graph.shortest(adj, root, goal, 5);
+    print("${target} ${semver.text_of(sol.picks[goal].1)} is in the solution because:");
+    for path in found {
+        var parts: [string] = [];
+        var k = 0;
+        while (k < path.len()) {
+            let p = sol.picks[path[k]];
+            let label = if (k == 0) { p.0 } else { "${p.0} ${semver.text_of(p.1)}" };
+            if (k + 1 < path.len()) {
+                let next = sol.picks[path[k + 1]].0;
+                parts.push("${label} (${next} ${reqs.get_or("${p.0}>${next}", "?")})");
+            } else {
+                parts.push(label);
+            }
+            k = k + 1;
+        }
+        print("  " + parts.join(" -> "));
+    }
+    Result.Ok(0)
+}
+
+// ---------------------------------------------------------------- outdated
+
+fn cmd_outdated(a: Args) -> Result<int, string> {
+    let m = manifest.load(manifest_path(a, 0))?;
+    let src = open_source(a)?;
+    let s = settings_of(a);
+    let run = resolve.run(src, m, s);
+    var locked: Map<string, string> = Map.new();
+    match (run.outcome) {
+        Outcome.Solved(sol) => {
+            for p in sol.picks {
+                locked.insert(p.0, semver.text_of(p.1));
+            }
+        },
+        Outcome.NoSolution(_) => eprint("raysolve: no solution; showing the index only (see `raysolve resolve`)"),
+        Outcome.Error(e) => return Result.Err(e),
+    }
+    let prov = resolve.provider(src, m, s);
+    var rows: [[string]] = [["package", "requirement", "locked", "compatible", "newest", ""]];
+    var behind = 0;
+    for d in m.deps {
+        let vs = prov.versions(d.0)?;
+        let r = req.parse(d.1)?;
+        var fits: [SemVer] = [];
+        for v in vs {
+            if (range.contains(r, v)) {
+                fits.push(v);
+            }
+        }
+        let newest = match (sort.max(vs)) {
+            Option.Some(v) => semver.text_of(v),
+            Option.None => "-",
+        };
+        let compatible = match (sort.max(fits)) {
+            Option.Some(v) => semver.text_of(v),
+            Option.None => "-",
+        };
+        let lock = locked.get_or(d.0, "-");
+        let note = if (newest != compatible) {
+            behind = behind + 1;
+            "requirement excludes the newest"
+        } else if (lock != compatible) {
+            "held back by another package"
+        } else {
+            ""
+        };
+        rows.push([d.0, d.1, lock, compatible, newest, note]);
+    }
+    var widths = [0, 0, 0, 0, 0, 0];
+    for row in rows {
+        var c = 0;
+        while (c < row.len()) {
+            if (row[c].len() > widths[c]) {
+                widths[c] = row[c].len();
+            }
+            c = c + 1;
+        }
+    }
+    for row in rows {
+        var cells: [string] = [];
+        var c = 0;
+        while (c < row.len()) {
+            cells.push(pad(row[c], widths[c]));
+            c = c + 1;
+        }
+        print(cells.join("  ").trim());
+    }
+    Result.Ok(if (behind > 0) { 1 } else { 0 })
+}
+
+// ---------------------------------------------------------------- bench / gen
+
+fn cmd_bench(a: Args) -> Result<int, string> {
+    print(
+        "index                     result       picked  decisions  conflicts  best of ${a.rounds}"
+    );
+    var sizes = [a.packages / 4, a.packages / 2, a.packages];
+    sizes = sort.dedup(sizes);
+    var total = 0;
+    for family in [
+        "random",
+        "hard"
+    ] {
+        for n in sizes {
+            if (n < 2) {
+                continue;
+            }
+            var seed = a.seed;
+            while (seed < a.seed + 3) {
+                let sh = if (family == "hard") {
+                    synth.hard_shape(n, seed)
+                } else {
+                    synth.shape(n, seed)
+                };
+                let built = synth.random_index(sh);
+                let mem = built.0;
+                let src: dyn Source = mem;
+                var best = -1;
+                var result = "";
+                var count = 0;
+                var stats = pubgrub.Stats {
+                    decisions: 0,
+                    derivations: 0,
+                    conflicts: 0,
+                    backjumps: 0,
+                    incompats: 0
+                };
+                var r = 0;
+                while (r < a.rounds) {
+                    // a fresh provider each round: caches are part of what is measured
+                    let run = resolve.run(src, built.1, resolve.settings());
+                    if (best < 0 || run.micros < best) {
+                        best = run.micros;
+                    }
+                    match (run.outcome) {
+                        Outcome.Solved(sol) => {
+                            result = "solved";
+                            count = sol.picks.len() - 1;
+                            stats = sol.stats;
+                        },
+                        Outcome.NoSolution(f) => {
+                            result = "no-solution";
+                            count = 0;
+                            stats = f.stats;
+                        },
+                        Outcome.Error(e) => return Result.Err(e),
+                    }
+                    r = r + 1;
+                }
+                let label = "${family}(${n}, seed ${seed})";
+                total = total + best;
+                print(
+                    "${pad(label, 26)}${pad(result, 13)}${pad(to_string(count), 8)}${pad(to_string(stats.decisions), 11)}${pad(to_string(stats.conflicts), 11)}${ms(best)}"
+                );
+                seed = seed + 1;
+            }
+        }
+    }
+    print("total ${ms(total)}");
+    Result.Ok(0)
+}
+
+fn cmd_gen(a: Args) -> Result<int, string> {
+    if (a.positional.len() == 0) {
+        return Result.Err("gen: where to? (a directory)");
+    }
+    let dir = a.positional[0];
+    let built = synth.random_index(synth.shape(a.packages, a.seed));
+    let mem = built.0;
+    fs.mkdir("${dir}/index")?;
+    for name in mem.pkgs.keys() {
+        fs.write_file(
+            "${dir}/index/${name}.json",
+            index.render_package(name, mem.pkgs.get(name).unwrap()) + "\n"
+        )?;
+    }
+    fs.write_file("${dir}/ray.toml", synth.manifest_toml(built.1))?;
+    print("wrote ${mem.pkgs.len()} packages to ${dir}/index and ${dir}/ray.toml");
+    Result.Ok(0)
+}
+
+fn main() -> int {
+    let a = match (parse_args(args())) {
+        Result.Ok(a) => a,
+        Result.Err(e) => {
+            eprint("raysolve: ${e}");
+            eprint(USAGE);
+            return 2;
+        },
+    };
+    let res = match (a.command) {
+        "resolve" => cmd_resolve(a),
+        "why" => cmd_why(a),
+        "outdated" => cmd_outdated(a),
+        "bench" => cmd_bench(a),
+        "gen" => cmd_gen(a),
+        "version" => {
+            print("raysolve ${VERSION}");
+            Result.Ok(0)
+        },
+        "help" => {
+            print(USAGE);
+            Result.Ok(0)
+        },
+        "" => {
+            print(USAGE);
+            Result.Ok(0)
+        },
+        other => Result.Err("unknown command '${other}' (try: raysolve help)"),
+    };
+    match (res) {
+        Result.Ok(code) => code,
+        Result.Err(e) => {
+            eprint("raysolve: ${e}");
+            2
+        },
+    }
+}

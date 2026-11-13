@@ -1,0 +1,53 @@
+//! The parts of a `ray.toml` the resolver needs: the package's name and version, and its
+//! `[dependencies]`. Path and git dependencies are not in any index: they are kept apart.
+
+import std/fs;
+import std/toml;
+import semver;
+from semver import SemVer;
+from std/toml import TomlValue;
+
+pub struct Manifest {
+    name: string,
+    version: SemVer,
+    /// (package, requirement) for the dependencies an index can answer, in file order
+    deps: [(string, string)],
+    /// (package, spec) for `path:` and `git+` dependencies
+    external: [(string, string)],
+}
+
+pub fn load(path: string) -> Result<Manifest, string> {
+    let text = fs.read_file(path).map_err(fn(e: string) -> string { "${path}: ${e}" })?;
+    parse(text).map_err(fn(e: string) -> string { "${path}: ${e}" })
+}
+
+pub fn parse(text: string) -> Result<Manifest, string> {
+    let entries = toml.parse_toml(text)?;
+    let name = match (toml.toml_get(entries, "package.name")) {
+        Option.Some(TomlValue.TStr(s)) => s,
+        _ => "root",
+    };
+    let version = match (toml.toml_get(entries, "package.version")) {
+        Option.Some(TomlValue.TStr(s)) => semver.parse(s)?,
+        _ => semver.new(0, 0, 0),
+    };
+    var deps: [(string, string)] = [];
+    var external: [(string, string)] = [];
+    for e in entries {
+        match (e.key.strip_prefix("dependencies.")) {
+            Option.Some(dep) => {
+                let spec = match (e.value) {
+                    TomlValue.TStr(s) => s,
+                    _ => return Result.Err("dependency '${dep}' must be a quoted string"),
+                };
+                if (spec.starts_with("path:") || spec.starts_with("git+")) {
+                    external.push((dep, spec));
+                } else {
+                    deps.push((dep, spec));
+                }
+            },
+            Option.None => { },
+        }
+    }
+    Result.Ok(Manifest { name: name, version: version, deps: deps, external: external })
+}

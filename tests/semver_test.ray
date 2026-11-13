@@ -30,8 +30,19 @@ fn rejects_malformed() {
 @test
 fn precedence_follows_the_spec_example() {
     // the exact chain of semver.org §11
-    let chain = ["1.0.0-alpha", "1.0.0-alpha.1", "1.0.0-alpha.beta", "1.0.0-beta", "1.0.0-beta.2",
-                 "1.0.0-beta.11", "1.0.0-rc.1", "1.0.0", "2.0.0", "2.1.0", "2.1.1"];
+    let chain = [
+        "1.0.0-alpha",
+        "1.0.0-alpha.1",
+        "1.0.0-alpha.beta",
+        "1.0.0-beta",
+        "1.0.0-beta.2",
+        "1.0.0-beta.11",
+        "1.0.0-rc.1",
+        "1.0.0",
+        "2.0.0",
+        "2.1.0",
+        "2.1.1"
+    ];
     var i = 0;
     while (i + 1 < chain.len()) {
         assert(v(chain[i]).less(v(chain[i + 1])));
