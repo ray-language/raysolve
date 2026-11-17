@@ -246,19 +246,13 @@ impl Source for Layered {
 }
 
 /// A directory becomes a DirSource, anything else a FileSource.
-///
-/// The concrete value is bound before it becomes a `dyn Source`: coercing a CALL result
-/// (`let s: dyn Source = dir_source(p)`) crashes the VM and is rejected by the native
-/// backend (README findings).
 pub fn open(path: string) -> Result<dyn Source, string> {
     if (fs.is_dir(path)) {
-        let d = dir_source(path);
-        let s: dyn Source = d;
+        let s: dyn Source = dir_source(path);
         return Result.Ok(s);
     }
     if (fs.exists(path)) {
-        let f = file_source(path);
-        let s: dyn Source = f;
+        let s: dyn Source = file_source(path);
         return Result.Ok(s);
     }
     Result.Err("index not found: ${path}")

@@ -2,8 +2,6 @@
 //! (versions and `Range<SemVer>`): filtering yanked and pre-release versions, parsing
 //! requirements once per release, and the root package made of the manifest.
 
-import std/collections/dict;
-import std/collections/set;
 import std/time;
 import index;
 import manifest;
@@ -11,8 +9,6 @@ import pubgrub;
 import range;
 import req;
 import semver;
-from std/collections/dict import Dict;
-from std/collections/set import Set;
 from index import Release, Source;
 from manifest import Manifest;
 from pubgrub import Dep, Outcome, Provider;
@@ -38,13 +34,13 @@ pub fn settings() -> Settings { Settings { pre: false, yanked: false } }
 
 /// The solver's view of a source for one manifest. The closures share the caches.
 pub fn provider(src: dyn Source, m: Manifest, s: Settings) -> Provider<string, SemVer> {
-    let parsed: Dict<PkgVer, Result<[Dep<string, SemVer>], string>> = dict.new();
+    let parsed: Map<PkgVer, Result<[Dep<string, SemVer>], string>> = Map.new();
     let listed: Map<string, [Release]> = Map.new();
     // packages whose pre-releases may be picked
-    let pre_ok: Set<string> = set.new();
+    let pre_ok: Map<string, bool> = Map.new();
     for d in m.deps {
         if (d.1.contains("-")) {
-            set.add(pre_ok, d.0);
+            pre_ok.insert(d.0, true);
         }
     }
     Provider {
@@ -58,7 +54,7 @@ pub fn provider(src: dyn Source, m: Manifest, s: Settings) -> Provider<string, S
                 if (r.yanked && !s.yanked) {
                     continue;
                 }
-                if (r.version.pre != "" && !s.pre && !set.has(pre_ok, p)) {
+                if (r.version.pre != "" && !s.pre && !pre_ok.contains_key(p)) {
                     continue;
                 }
                 vs.push(r.version);
@@ -67,7 +63,7 @@ pub fn provider(src: dyn Source, m: Manifest, s: Settings) -> Provider<string, S
         },
         deps: fn(p: string, v: SemVer) -> Result<[Dep<string, SemVer>], string> {
             let key = PkgVer { name: p, version: v };
-            match (dict.get(parsed, key)) {
+            match (parsed.get(key)) {
                 Option.Some(r) => return r,
                 Option.None => { },
             }
@@ -94,7 +90,7 @@ pub fn provider(src: dyn Source, m: Manifest, s: Settings) -> Provider<string, S
             } else {
                 Result.Err(err)
             };
-            dict.insert(parsed, key, res);
+            parsed.insert(key, res);
             res
         }
     }

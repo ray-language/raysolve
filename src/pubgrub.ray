@@ -4,11 +4,10 @@
 //!
 //! Generic over the package type `P` and the version type `V`. raylang has no supertraits and
 //! no generic traits in bounds (`S: Source<V>` does not parse), so the bound is spelled in full
-//! and the package index reaches the solver as a `Provider` of two closures.
+//! and the package index reaches the solver as a `Provider` of two closures. The per-package
+//! tables are native `Map`s, which is why `P` carries `MapKey`.
 
-import std/collections/dict;
 import range;
-from std/collections/dict import Dict;
 from range import Range;
 from version import Version;
 
@@ -77,20 +76,20 @@ struct Assignment<P, V> {
     cause: int,
 }
 
-struct State<P, V> {
+struct State<P: MapKey, V> {
     root: P,
     provider: Provider<P, V>,
     incompats: [Incompat<P, V>],
-    by_pkg: Dict<P, [int]>,
+    by_pkg: Map<P, [int]>,
     assigns: [Assignment<P, V>],
-    assigned: Dict<P, [int]>,
+    assigned: Map<P, [int]>,
     /// the intersection of every assignment of a package, kept in step with `assigns`
-    acc: Dict<P, Term<P, V>>,
-    decided: Dict<P, V>,
+    acc: Map<P, Term<P, V>>,
+    decided: Map<P, V>,
     /// packages in the order they first got an assignment (deterministic decisions)
     seen: [P],
     level: int,
-    versions: Dict<P, [V]>,
+    versions: Map<P, [V]>,
     stats: Stats,
 }
 
@@ -126,6 +125,7 @@ fn negate<P, V>(t: Term<P, V>) -> Term<P, V> {
 
 /// "p is anything (or nothing)": the neutral element of term intersection.
 fn any_term<P, V>(p: P) -> Term<P, V> {
+    // typed let: a generic call does not take its type from a generic parameter (findings #358)
     let none: Range<V> = range.empty();
     Term.Neg(p, none)
 }
@@ -179,70 +179,70 @@ fn is_any<P, V>(t: Term<P, V>) -> bool {
 
 // ---------------------------------------------------------------- state
 
-fn add_incompat<P: Hash + Eq, V>(st: State<P, V>, inc: Incompat<P, V>) -> int {
+fn add_incompat<P: MapKey + Eq, V>(st: State<P, V>, inc: Incompat<P, V>) -> int {
     let idx = st.incompats.len();
     st.incompats.push(inc);
     st.stats.incompats = st.stats.incompats + 1;
     for t in inc.terms {
         let p = term_pkg(t);
-        var list = dict.get(st.by_pkg, p).unwrap_or([]);
+        var list = st.by_pkg.get(p).unwrap_or([]);
         list.push(idx);
-        dict.insert(st.by_pkg, p, list);
+        st.by_pkg.insert(p, list);
     }
     idx
 }
 
 /// Store a derived incompatibility for the explanation without indexing it for propagation.
-fn store_incompat<P, V>(st: State<P, V>, inc: Incompat<P, V>) -> int {
+fn store_incompat<P: MapKey, V>(st: State<P, V>, inc: Incompat<P, V>) -> int {
     st.incompats.push(inc);
     st.stats.incompats = st.stats.incompats + 1;
     st.incompats.len() - 1
 }
 
-fn index_incompat<P: Hash + Eq, V>(st: State<P, V>, idx: int) {
+fn index_incompat<P: MapKey + Eq, V>(st: State<P, V>, idx: int) {
     for t in st.incompats[idx].terms {
         let p = term_pkg(t);
-        var list = dict.get(st.by_pkg, p).unwrap_or([]);
+        var list = st.by_pkg.get(p).unwrap_or([]);
         if (!list.contains(idx)) {
             list.push(idx);
-            dict.insert(st.by_pkg, p, list);
+            st.by_pkg.insert(p, list);
         }
     }
 }
 
-fn accumulated<P: Hash + Eq, V>(st: State<P, V>, p: P) -> Term<P, V> {
-    match (dict.get(st.acc, p)) {
+fn accumulated<P: MapKey + Eq, V>(st: State<P, V>, p: P) -> Term<P, V> {
+    match (st.acc.get(p)) {
         Option.Some(t) => t,
         Option.None => any_term(p),
     }
 }
 
-fn assign<P: Hash + Eq, V: Ord>(st: State<P, V>, t: Term<P, V>, cause: int) {
+fn assign<P: MapKey + Eq, V: Ord>(st: State<P, V>, t: Term<P, V>, cause: int) {
     let p = term_pkg(t);
     st.assigns.push(Assignment { term: t, level: st.level, cause: cause });
-    var list = dict.get(st.assigned, p).unwrap_or([]);
+    var list = st.assigned.get(p).unwrap_or([]);
     if (list.len() == 0) {
         st.seen.push(p);
     }
     list.push(st.assigns.len() - 1);
-    dict.insert(st.assigned, p, list);
-    dict.insert(st.acc, p, intersect_terms(accumulated(st, p), t));
+    st.assigned.insert(p, list);
+    st.acc.insert(p, intersect_terms(accumulated(st, p), t));
 }
 
-fn derive<P: Hash + Eq, V: Ord>(st: State<P, V>, t: Term<P, V>, cause: int) {
+fn derive<P: MapKey + Eq, V: Ord>(st: State<P, V>, t: Term<P, V>, cause: int) {
     st.stats.derivations = st.stats.derivations + 1;
     assign(st, t, cause);
 }
 
-fn decide<P: Hash + Eq, V: Ord>(st: State<P, V>, p: P, v: V) {
+fn decide<P: MapKey + Eq, V: Ord>(st: State<P, V>, p: P, v: V) {
     st.level = st.level + 1;
     st.stats.decisions = st.stats.decisions + 1;
     assign(st, Term.Pos(p, range.exact(v)), -1);
-    dict.insert(st.decided, p, v);
+    st.decided.insert(p, v);
 }
 
 /// Drop every assignment above `level` and rebuild the per-package views.
-fn backtrack<P: Hash + Eq, V: Ord>(st: State<P, V>, level: int) {
+fn backtrack<P: MapKey + Eq, V: Ord>(st: State<P, V>, level: int) {
     st.stats.backjumps = st.stats.backjumps + 1;
     var keep: [Assignment<P, V>] = [];
     for a in st.assigns {
@@ -251,22 +251,22 @@ fn backtrack<P: Hash + Eq, V: Ord>(st: State<P, V>, level: int) {
         }
     }
     st.assigns = keep;
-    st.assigned = dict.new();
-    st.acc = dict.new();
-    st.decided = dict.new();
+    st.assigned = Map.new();
+    st.acc = Map.new();
+    st.decided = Map.new();
     let old_seen = st.seen;
     st.seen = [];
     var i = 0;
     while (i < keep.len()) {
         let a = keep[i];
         let p = term_pkg(a.term);
-        var list = dict.get(st.assigned, p).unwrap_or([]);
+        var list = st.assigned.get(p).unwrap_or([]);
         list.push(i);
-        dict.insert(st.assigned, p, list);
-        dict.insert(st.acc, p, intersect_terms(accumulated(st, p), a.term));
+        st.assigned.insert(p, list);
+        st.acc.insert(p, intersect_terms(accumulated(st, p), a.term));
         if (a.cause < 0) {
             match (range.floor(term_range(a.term))) {
-                Option.Some(v) => dict.insert(st.decided, p, v),
+                Option.Some(v) => st.decided.insert(p, v),
                 Option.None => { },
             }
         }
@@ -274,7 +274,7 @@ fn backtrack<P: Hash + Eq, V: Ord>(st: State<P, V>, level: int) {
     }
     // keep the original first-seen order of the packages that survived
     for p in old_seen {
-        if (dict.has(st.assigned, p)) {
+        if (st.assigned.contains_key(p)) {
             st.seen.push(p);
         }
     }
@@ -293,7 +293,7 @@ const INCONCLUSIVE: int = 3;
 
 /// How the partial solution relates to an incompatibility: (kind, index of the one
 /// unsatisfied term when kind is ALMOST).
-fn relation<P: Hash + Eq, V: Ord>(st: State<P, V>, idx: int) -> (int, int) {
+fn relation<P: MapKey + Eq, V: Ord>(st: State<P, V>, idx: int) -> (int, int) {
     let inc = st.incompats[idx];
     var unsat = -1;
     var i = 0;
@@ -317,11 +317,11 @@ fn relation<P: Hash + Eq, V: Ord>(st: State<P, V>, idx: int) -> (int, int) {
 // ---------------------------------------------------------------- propagation
 
 /// Unit propagation from `start`. `Err(idx)` = the root incompatibility of a failure.
-fn propagate<P: Hash + Eq, V: Ord>(st: State<P, V>, start: P) -> Result<int, int> {
+fn propagate<P: MapKey + Eq, V: Ord>(st: State<P, V>, start: P) -> Result<int, int> {
     var changed = [start];
     while (changed.len() > 0) {
         let pkg = changed.pop().unwrap();
-        let list = dict.get(st.by_pkg, pkg).unwrap_or([]);
+        let list = st.by_pkg.get(pkg).unwrap_or([]);
         var k = list.len() - 1;
         var restart = false;
         while (k >= 0 && !restart) {
@@ -343,7 +343,7 @@ fn propagate<P: Hash + Eq, V: Ord>(st: State<P, V>, start: P) -> Result<int, int
                 let t = st.incompats[idx].terms[rel.1];
                 derive(st, negate(t), idx);
                 let q = term_pkg(t);
-                if (!member(changed, q)) {
+                if (!changed.contains(q)) {
                     changed.push(q);
                 }
             }
@@ -353,18 +353,7 @@ fn propagate<P: Hash + Eq, V: Ord>(st: State<P, V>, start: P) -> Result<int, int
     Result.Ok(0)
 }
 
-/// `xs.contains(x)` for a generic `P: Eq`. The method form compiles on the VM but breaks the
-/// native build (E0369: `==` cannot be applied to type `P`), see the README's findings.
-fn member<P: Eq>(xs: [P], x: P) -> bool {
-    for y in xs {
-        if (y == x) {
-            return true;
-        }
-    }
-    false
-}
-
-fn is_terminal<P: Eq, V>(st: State<P, V>, inc: Incompat<P, V>) -> bool {
+fn is_terminal<P: MapKey + Eq, V>(st: State<P, V>, inc: Incompat<P, V>) -> bool {
     if (inc.terms.len() == 0) {
         return true;
     }
@@ -377,14 +366,14 @@ fn is_terminal<P: Eq, V>(st: State<P, V>, inc: Incompat<P, V>) -> bool {
 
 /// Index of the first assignment of `p` after which the accumulated term satisfies `t`
 /// (starting from `start`, intersected first), or -1.
-fn satisfier_of<P: Hash + Eq, V: Ord>(
+fn satisfier_of<P: MapKey + Eq, V: Ord>(
     st: State<P, V>,
     t: Term<P, V>,
     start: Term<P, V>,
     before: int
 ) -> int {
     var acc = start;
-    for i in dict.get(st.assigned, term_pkg(t)).unwrap_or([]) {
+    for i in st.assigned.get(term_pkg(t)).unwrap_or([]) {
         if (i >= before) {
             return -1;
         }
@@ -398,7 +387,7 @@ fn satisfier_of<P: Hash + Eq, V: Ord>(
 
 /// Conflict resolution: walk back from a satisfied incompatibility, combining it with the
 /// causes of its satisfiers until it can be backjumped to. Returns the learned incompatibility.
-fn resolve_conflict<P: Hash + Eq, V: Ord>(st: State<P, V>, conflict: int) -> Result<int, int> {
+fn resolve_conflict<P: MapKey + Eq, V: Ord>(st: State<P, V>, conflict: int) -> Result<int, int> {
     st.stats.conflicts = st.stats.conflicts + 1;
     var cur = conflict;
     while (true) {
@@ -498,12 +487,12 @@ fn merge_term<P: Eq, V: Ord>(terms: [Term<P, V>], t: Term<P, V>) -> [Term<P, V>]
 
 // ---------------------------------------------------------------- decisions
 
-fn versions_of<P: Hash + Eq, V>(st: State<P, V>, p: P) -> Result<[V], string> {
-    match (dict.get(st.versions, p)) {
+fn versions_of<P: MapKey + Eq, V>(st: State<P, V>, p: P) -> Result<[V], string> {
+    match (st.versions.get(p)) {
         Option.Some(vs) => Result.Ok(vs),
         Option.None => {
             let vs = st.provider.versions(p)?;
-            dict.insert(st.versions, p, vs);
+            st.versions.insert(p, vs);
             Result.Ok(vs)
         },
     }
@@ -512,21 +501,13 @@ fn versions_of<P: Hash + Eq, V>(st: State<P, V>, p: P) -> Result<[V], string> {
 /// The best version of a range: the highest release, else the highest pre-release.
 fn pick<V: Ord + Version>(vs: [V], r: Range<V>) -> Option<V> {
     var best: Option<V> = Option.None;
-    var it = range.in_range(vs, r);
-    var go = true;
-    // `for v in it` crashes on a bounded generic iterator impl (findings), so drive next()
-    while (go) {
-        match (it.next()) {
-            Option.Some(v) => {
-                if (!v.is_prerelease()) {
-                    best = Option.Some(v);
-                } else if (best.is_none()) {
-                    best = Option.Some(v);
-                } else if (best.unwrap().is_prerelease()) {
-                    best = Option.Some(v);
-                }
-            },
-            Option.None => go = false,
+    for v in range.in_range(vs, r) {
+        if (!v.is_prerelease()) {
+            best = Option.Some(v);
+        } else if (best.is_none()) {
+            best = Option.Some(v);
+        } else if (best.unwrap().is_prerelease()) {
+            best = Option.Some(v);
         }
     }
     best
@@ -536,11 +517,11 @@ fn count_in<V: Ord>(vs: [V], r: Range<V>) -> int { range.in_range(vs, r).collect
 
 /// The next package to decide: an undecided package with a positive derivation, the one
 /// with the fewest candidate versions first (the likeliest to conflict).
-fn next_package<P: Hash + Eq, V: Ord>(st: State<P, V>) -> Result<Option<P>, string> {
+fn next_package<P: MapKey + Eq, V: Ord>(st: State<P, V>) -> Result<Option<P>, string> {
     var best: Option<P> = Option.None;
     var best_n = 0;
     for p in st.seen {
-        if (dict.has(st.decided, p)) {
+        if (st.decided.contains_key(p)) {
             continue;
         }
         match (accumulated(st, p)) {
@@ -560,7 +541,7 @@ fn next_package<P: Hash + Eq, V: Ord>(st: State<P, V>) -> Result<Option<P>, stri
 /// The versions next to `v` (in `vs`) whose dependency on `q` is the same range: one
 /// incompatibility then covers them all ("web >=0.6.0 depends on net ^0.11.0"). The range
 /// is open at the ends of the list, like pub does.
-fn dep_span<P: Hash + Eq, V: Ord + Eq>(
+fn dep_span<P: MapKey + Eq, V: Ord + Eq>(
     st: State<P, V>,
     p: P,
     vs: [V],
@@ -582,7 +563,7 @@ fn dep_span<P: Hash + Eq, V: Ord + Eq>(
     range.intersect(low, high)
 }
 
-fn same_dep<P: Eq, V: Ord + Eq>(st: State<P, V>, p: P, v: V, q: P, r: Range<V>) -> bool {
+fn same_dep<P: MapKey + Eq, V: Ord + Eq>(st: State<P, V>, p: P, v: V, q: P, r: Range<V>) -> bool {
     match (st.provider.deps(p, v)) {
         Result.Ok(deps) => {
             for d in deps {
@@ -597,14 +578,14 @@ fn same_dep<P: Eq, V: Ord + Eq>(st: State<P, V>, p: P, v: V, q: P, r: Range<V>) 
 }
 
 /// Is version v of p already covered by a dependency incompatibility on q with range r?
-fn has_dep_incompat<P: Hash + Eq, V: Ord + Eq>(
+fn has_dep_incompat<P: MapKey + Eq, V: Ord + Eq>(
     st: State<P, V>,
     p: P,
     v: V,
     q: P,
     r: Range<V>
 ) -> bool {
-    for idx in dict.get(st.by_pkg, p).unwrap_or([]) {
+    for idx in st.by_pkg.get(p).unwrap_or([]) {
         let inc = st.incompats[idx];
         match (inc.cause) {
             Cause.Dependency => {
@@ -632,7 +613,7 @@ pub struct Options {
 pub fn options() -> Options { Options { max_steps: 1000000 } }
 
 /// Find versions for `root` (at `root_version`) and everything it depends on.
-pub fn solve<P: Hash + Eq + Show, V: Ord + Hash + Eq + Show + Version>(
+pub fn solve<P: MapKey + Eq + Show, V: Ord + Hash + Eq + Show + Version>(
     prov: Provider<P, V>,
     root: P,
     root_version: V,
@@ -641,11 +622,11 @@ pub fn solve<P: Hash + Eq + Show, V: Ord + Hash + Eq + Show + Version>(
     let incompats: [Incompat<P, V>] = [];
     let assigns: [Assignment<P, V>] = [];
     let seen: [P] = [];
-    let by_pkg: Dict<P, [int]> = dict.new();
-    let assigned: Dict<P, [int]> = dict.new();
-    let acc: Dict<P, Term<P, V>> = dict.new();
-    let decided: Dict<P, V> = dict.new();
-    let cache: Dict<P, [V]> = dict.new();
+    let by_pkg: Map<P, [int]> = Map.new();
+    let assigned: Map<P, [int]> = Map.new();
+    let acc: Map<P, Term<P, V>> = Map.new();
+    let decided: Map<P, V> = Map.new();
+    let cache: Map<P, [V]> = Map.new();
     let st = State {
         root: root,
         provider: prov,
@@ -686,7 +667,7 @@ pub fn solve<P: Hash + Eq + Show, V: Ord + Hash + Eq + Show + Version>(
             Option.None => {
                 var picks: [(P, V)] = [];
                 for q in st.seen {
-                    match (dict.get(st.decided, q)) {
+                    match (st.decided.get(q)) {
                         Option.Some(v) => picks.push((q, v)),
                         Option.None => { },
                     }
@@ -709,7 +690,7 @@ pub fn solve<P: Hash + Eq + Show, V: Ord + Hash + Eq + Show + Version>(
         };
         let at = match (index_of_version(vs, v)) {
             Option.Some(i) => i,
-            Option.None => return Outcome.Error("version list of ${p.show()} changed"),
+            Option.None => return Outcome.Error("version list of ${p} changed"),
         };
         var conflict = false;
         match (st.provider.deps(p, v)) {

@@ -88,8 +88,13 @@ fn bad_requirements() {
 fn in_range_iterator() {
     let xs = [1, 2, 3, 4, 5, 6, 7, 8];
     let rr = range.union(range.between(2, 4), range.at_least(7));
-    // collect() works; a for loop over this bounded impl does not (README findings)
     assert_eq(range.in_range(xs, rr).collect(), [2, 3, 7, 8]);
+    // a for over this bounded impl (it crashed both engines before raylang 1.27.103, #352)
+    var seen: [int] = [];
+    for v in range.in_range(xs, rr) {
+        seen.push(v);
+    }
+    assert_eq(seen, [2, 3, 7, 8]);
     var it = range.in_range(xs, range.exact(5));
     assert_eq(it.next(), Option.Some(5));
     assert_eq(it.next(), Option.None);

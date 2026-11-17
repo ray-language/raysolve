@@ -54,12 +54,12 @@ fn is_derived<P, V>(inc: Incompat<P, V>) -> bool {
 /// `web ^0.6.0`, `every version of web`, or just `app` for the root package.
 pub fn show_term_body<P: Eq + Show, V: Ord + Eq + Version>(root: P, p: P, r: Range<V>) -> string {
     if (p == root) {
-        return p.show();
+        return to_string(p);
     }
     if (range.is_full(r)) {
-        return "every version of ${p.show()}";
+        return "every version of ${p}";
     }
-    "${p.show()} ${range.show_range(r)}"
+    "${p} ${range.show_range(r)}"
 }
 
 fn body<P: Eq + Show, V: Ord + Eq + Version>(root: P, t: Term<P, V>) -> string {
@@ -70,16 +70,16 @@ fn body<P: Eq + Show, V: Ord + Eq + Version>(root: P, t: Term<P, V>) -> string {
 pub fn describe<P: Eq + Show, V: Ord + Eq + Version>(root: P, inc: Incompat<P, V>) -> string {
     let ts = inc.terms;
     match (inc.cause) {
-        Cause.Root => return "${root.show()} is the project being solved",
+        Cause.Root => return "${root} is the project being solved",
         Cause.Dependency => {
             if (ts.len() == 2) {
                 let depender = body(root, ts[0]);
                 let target = pubgrub.term_pkg(ts[1]);
                 let r = pubgrub.term_range(ts[1]);
                 if (range.is_full(r)) {
-                    return "${depender} depends on ${target.show()}";
+                    return "${depender} depends on ${target}";
                 }
-                return "${depender} depends on ${target.show()} ${range.show_range(r)}";
+                return "${depender} depends on ${target} ${range.show_range(r)}";
             }
         },
         Cause.NoVersions => {
@@ -87,9 +87,9 @@ pub fn describe<P: Eq + Show, V: Ord + Eq + Version>(root: P, inc: Incompat<P, V
                 let r = pubgrub.term_range(ts[0]);
                 let p = pubgrub.term_pkg(ts[0]);
                 if (range.is_full(r)) {
-                    return "no versions of ${p.show()} exist in the index";
+                    return "no versions of ${p} exist in the index";
                 }
-                return "no versions of ${p.show()} match ${range.show_range(r)}";
+                return "no versions of ${p} match ${range.show_range(r)}";
             }
         },
         Cause.Unavailable(msg) => {

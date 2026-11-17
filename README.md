@@ -31,7 +31,7 @@ yaml     = "0.1.1"
 
 Es una app de *dogfooding*: su razón de ser es ejercitar la parte de raylang que las demás apps
 apenas tocan — **traits propios, genéricos con bounds, structs y enums genéricos, `dyn Trait`,
-iteradores propios, `std/collections/dict` y `set` con claves de usuario, `impl Ord` a mano,
+iteradores propios, `Map` con claves genéricas (`P: MapKey`) y de usuario, `impl Ord` a mano,
 `std/sort`, alias `type`** — y anotar lo que se rompe (ver [Hallazgos](#hallazgos-de-dogfood)).
 
 ## Uso
@@ -98,7 +98,7 @@ a dos saltos), una pre-versión pedida por nombre y un paquete inexistente.
 | `pubgrub.ray` | el resolutor, **genérico** en el paquete `P` y la versión `V`: `Term<P, V>`, `Incompat<P, V>`, `Outcome<P, V>`; propagación unitaria, aprendizaje de conflictos y salto atrás; las dependencias de versiones consecutivas iguales se agrupan en una sola incompatibilidad (`web >=0.6.0 depends on net ^0.11.0`), como hace pub |
 | `explain.ray` | el grafo de derivación en frases numeradas; **`TreeWalk<P, V>`**, un iterador en preorden para `--tree` |
 | `index.ray` | `trait Source` usado como **`dyn Source`**: directorio, archivo, memoria y `Layered { layers: [dyn Source] }` |
-| `resolve.ray` | adapta un `dyn Source` al resolutor: un `Provider<P, V>` de dos closures que comparten cachés (un `Dict<PkgVer, …>` con clave propia derivada) |
+| `resolve.ray` | adapta un `dyn Source` al resolutor: un `Provider<P, V>` de dos closures que comparten cachés (un `Map<PkgVer, …>` con clave propia derivada) |
 | `graph.ray` | **`Paths`**, iterador perezoso de caminos simples (para `why`) |
 | `synth.ray` | índices sintéticos con un LCG propio en `u64` (mismos números en VM y nativo) |
 
@@ -109,29 +109,32 @@ de closures en vez de un `S: Source<V>`.
 
 ## Rendimiento
 
-`make bench` / `make bench-vm`: índices generados de 100, 200 y 400 paquetes, tres semillas por
-tamaño, el mejor de 3 (raylang 1.27.95, Apple Silicon, máquina compartida con carga ~12).
+`make bench` / `make bench-vm`: índices generados de 200, 400 y 800 paquetes, tres semillas por
+tamaño, el mejor de 3 (raylang 1.27.103, Apple Silicon, máquina compartida con carga ~5).
 
 | Índice | Resultado | Decisiones | Conflictos | VM | Nativo `--release` |
 |---|---|---:|---:|---:|---:|
-| random(100, seed 1) | resuelto (52 paquetes) | 112 | 9 | 44.6 ms | 2.13 ms |
-| random(400, seed 2) | resuelto (41) | 211 | 15 | 88.7 ms | 4.18 ms |
-| hard(100, seed 2) | resuelto (59) | 151 | 7 | 74.9 ms | 3.64 ms |
-| hard(200, seed 1) | resuelto (112) | 793 | 34 | 564 ms | 24.6 ms |
-| hard(200, seed 3) | resuelto (47) | 280 | 14 | 182 ms | 8.73 ms |
-| hard(400, seed 1) | sin solución | 35 | 7 | 54.4 ms | 2.30 ms |
-| **las 18** | | | | **1343 ms** | **60.4 ms** |
+| random(200, seed 1) | resuelto (24 paquetes) | 133 | 17 | 20.8 ms | 1.31 ms |
+| random(400, seed 2) | resuelto (41) | 211 | 15 | 38.4 ms | 2.29 ms |
+| hard(200, seed 1) | resuelto (112) | 793 | 34 | 217 ms | 13.0 ms |
+| hard(200, seed 3) | resuelto (47) | 280 | 14 | 84.9 ms | 4.93 ms |
+| hard(400, seed 1) | sin solución | 35 | 7 | 21.0 ms | 1.22 ms |
+| hard(800, seed 1) | sin solución | 115 | 12 | 111 ms | 6.35 ms |
+| **las 18** | | | | **643 ms** | **38.2 ms** |
 
-El nativo va **~22× más rápido**, con 13 MB de RSS; los dos motores toman exactamente las mismas
-decisiones. `ray profile` sobre la VM: el 23 % del tiempo es `dict.get` + `string#hash` (el `Dict`
-genérico de `std/collections` es raylang puro, y en código genérico sobre `P` no hay `Map`) y otro
-21 % es `InRange#next` + `range.intersect` (contar candidatos al elegir paquete).
+El nativo va **~17× más rápido**, con 13 MB de RSS; los dos motores toman exactamente las mismas
+decisiones. Con raylang 1.27.103 las tablas del resolutor pasaron del `Dict` de
+`std/collections` (raylang puro, ~5,8 µs por `get` en la VM) al `Map` nativo con `P: MapKey`
+(~0,18 µs): en la misma máquina y con las mismas decisiones, las 18 bajaron de 1107 a 643 ms en la
+VM (−42 %) y de 60 a 38 ms en nativo (−35 %). `ray profile` sobre la VM: ahora domina contar
+candidatos al elegir paquete, `InRange#next` + `range.intersect` (27 %); el `get` del `Map` es
+el 5,7 %.
 
 ## Estado
 
 | Qué | Estado |
 |---|---|
-| Semver, rangos, requisitos, resolutor, explicaciones, fuentes, CLI | **34 tests** en VM y nativo (`make test`, `make test-native`), raylang 1.27.95 |
+| Semver, rangos, requisitos, resolutor, explicaciones, fuentes, CLI | **34 tests** en VM y nativo (`make test`, `make test-native`), raylang 1.27.103 |
 | VM frente a nativo | `make diff`: 14 órdenes con la misma salida en los dos motores |
 | Índices de disco | `make stress`: 600 paquetes escritos y leídos de JSON |
 
@@ -142,7 +145,9 @@ historia suficiente.
 ## Hallazgos de dogfood
 
 Once bugs y huecos de raylang, con su reproducción mínima (raylang 1.27.95), registrados en
-`ray-apps/findings/` (campaña `raysolve-1.27.95`) como #352–#362, en este mismo orden. Los rodeos están
+`ray-apps/findings/` (campaña `raysolve-1.27.95`) como #352–#362, en este mismo orden. Re-medidos
+con 1.27.103 (campaña `raysolve-1.27.103`): siete arreglados, dos a medias y dos que siguen igual.
+Los rodeos de los arreglados ya se quitaron del código, salvo el del punto 9. Los que quedan están
 marcados en el código.
 
 1. **[B]** Un `for` sobre un iterador propio cuyo `impl` lleva bounds (`impl<V: Ord>
@@ -150,42 +155,59 @@ marcados en el código.
    guarantees a function» y el nativo no compila (E0061, faltan los diccionarios del bound).
    `.next()`, `.collect()` y `.take()` sí funcionan; sin bounds, `for` también. Rodeo: un `while`
    con `next()` (y sin `while let`, ver 6).
+   **✅ 1.27.103**: `pick` ya recorre `InRange` con `for`, y un test lo cubre.
 2. **[B]** `let s: dyn Shape = square(2);` (el inicializador es una LLAMADA) y luego `s.name()`:
    ICE en la VM, y el nativo lo rechaza con «call to an expression (neither a name nor a method) is
    not supported». Con `let sq = square(2); let s: dyn Shape = sq;` funciona.
+   **✅ 1.27.103**: `index.open` ya coacciona la llamada directamente.
 3. **[B]** Nativo: `xs.contains(x)` con `xs: [P]`, `P: Eq` no compila (E0369: `==` no aplica a
    `P`). La VM lo acepta. Rodeo: un bucle con `==`.
+   **✅ 1.27.103**: `changed.contains(q)` en lugar del bucle.
 4. **[B]** Nativo: el tipo de los elementos que devuelve un campo `fn` de un struct genérico se
    pierde: `"${d.0}"` sobre `prov.deps("x")` da «unknown return type of '__concat'». Rodeo: `let
    name: string = d.0;`.
+   **✅ 1.27.103**: sin `let` anotados en `why`.
 5. **[B]** `Map<P, int>` con `P: Hash + Eq` genérico pasa el checker y funciona en la VM, pero el
    nativo falla en cargo (E0599); con un tipo de usuario concreto el checker lo rechaza («a Map key
    must be int/string/…»). O una cosa o la otra.
+   **✅ 1.27.103**: hay un bound `MapKey` (con `Hash + Eq` el checker lo rechaza y lo sugiere), y el
+   resolutor usa `Map` nativo.
 6. **[E]** No hay `while let` (`while let Option.Some(x) = it.next()` → «expected '(' after
    'while'»), ni supertraits (`trait Version: Ord + Hash` → «expected '{' after the trait name»),
    ni traits genéricos en bounds o `dyn` (`S: Source<V>`, `dyn Source<V>` no parsean, aunque `trait
    Source<V>` e `impl<V> Source<V> for X<V>` sí). Ninguna de las tres cosas está documentada.
+   **❌ 1.27.103**: sigue igual y sin documentar.
 7. **[E]** La inferencia no baja del contexto a los genéricos: `Bound.Unbounded` en un campo o un
    argumento cuando el tipo esperado es `Bound<V>`, `range.empty()` como argumento, `[]` como
    elemento de `[[int]]`, o `Solution { picks: [("net", 14)] }` con `picks: [(P, V)]` («must be (P,
    V), not (string, int)») piden anotación; solo un `let x: T = …` la da, y no hay sintaxis de
    argumentos de tipo explícitos.
+   **⚠️ 1.27.103**: ya funcionan el struct genérico con tuplas y una llamada genérica pasada a un
+   parámetro concreto; con un parámetro genérico (`Term.Neg(p, range.empty())`, `satisfier_of(…,
+   any_term(…), …)`, `range.full()` en una rama de `if`) sigue pidiendo el `let` anotado, igual que
+   `Bound.Unbounded`, `[]` anidado y `none::<V>()`.
 8. **[B]** `print(x)` ignora un `impl Show` escrito a mano (imprime `Plain { n: 1 }`), mientras
    `to_string(x)` y `"${x}"` sí lo usan. Y al revés en genéricos: `to_string(p)` y `"${p}"` con `p:
    P`, `P: Show`, no compilan («to_string only converts int/…»); hay que escribir `p.show()`.
+   **✅ 1.27.103**: `explain` usa `"${p}"` y `to_string(p)`.
 9. **[B/D]** `@derive(Hash)` en un struct con un campo `[string]` da «no field or function 'hash'
    applicable to [string]» en una posición inventada (`50999995:1`) atribuida a otro módulo
    (`std/collections/set`, `version`…), no al `@derive`. La doc no dice que los arrays no sean
    derivables. Rodeo: `pre: string`.
+   **✅ 1.27.103**: el error señala el `@derive` y el campo, y la restricción está documentada; los
+   arrays siguen sin `Hash`, así que `pre: string` se queda.
 10. **[B]** En un proyecto sin `src/main.ray`, `ray test tests/x_test.ray` no encuentra los
     módulos de `src/` (y la lista de rutas que muestra incluye el directorio padre y `tests` dos
     veces); `ray test` a secas sí.
+    **❌ 1.27.103**: sigue igual.
 11. **[D]** §9 (Iteradores) dice que `Iter<T>` está «respaldado por un closure» pero no cuenta
     cómo crear uno desde un closure, ni que un `impl Iterator<T>` propio hereda `map`, `take`,
     `collect`… (sí lo hace), ni la restricción del punto 1.
+    **⚠️ 1.27.103**: ya dice que un iterador propio hereda los adaptadores; faltan el ejemplo y cómo
+    crear un `Iter<T>` desde un closure.
 
 Lo que salió bien a la primera: `impl Ord` a mano usado por `sort`, `std/sort` (`binary_search`,
-`dedup`, `merge`, `sort_desc`, `max`) y `sort_by`; `Dict`/`Set` con claves `@derive(Hash, Eq)`;
+`dedup`, `merge`, `sort_desc`, `max`) y `sort_by`; claves `@derive(Hash, Eq)` en colecciones;
 `[dyn Source]` en un struct y `Result<dyn Source, _>`; enums y structs genéricos anidados
 (`Term<P, V>` con `Range<V>` dentro); closures que capturan un `dyn` y `Map`s y los mutan; `u64`
 que envuelve igual en VM y nativo; `std/toml` con patrones anidados calificados

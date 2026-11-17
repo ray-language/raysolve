@@ -314,8 +314,7 @@ fn show_seg<V: Ord + Eq + Version>(s: Seg<V>) -> string {
 /// The versions of a sorted list that fall in a range, lazily, in order.
 ///
 /// Implemented by hand because the list is filtered with the range's own bounds walk
-/// (one pass, no re-scan per segment). NOTE: a `for` over this iterator crashes both engines
-/// when the `impl` carries a bound (see the README's findings), so callers drive `next()`.
+/// (one pass, no re-scan per segment). It inherits the `Iter` adapters and works in a `for`.
 pub struct InRange<V> {
     xs: [V],
     i: int,

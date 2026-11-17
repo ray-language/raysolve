@@ -262,13 +262,10 @@ fn cmd_why(a: Args) -> Result<int, string> {
     for p in sol.picks {
         var kids: [int] = [];
         for d in prov.deps(p.0, p.1)? {
-            // typed lets: the native backend loses the type of `d.0` in "${d.0}" here
-            let from_name: string = p.0;
-            let to_name: string = d.0;
-            match (at.get(to_name)) {
+            match (at.get(d.0)) {
                 Option.Some(k) => {
                     kids.push(k);
-                    reqs.insert("${from_name}>${to_name}", range.show_range(d.1));
+                    reqs.insert("${p.0}>${d.0}", range.show_range(d.1));
                 },
                 Option.None => { },
             }
