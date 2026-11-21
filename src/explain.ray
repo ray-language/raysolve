@@ -52,7 +52,7 @@ fn is_derived<P, V>(inc: Incompat<P, V>) -> bool {
 }
 
 /// `web ^0.6.0`, `every version of web`, or just `app` for the root package.
-pub fn show_term_body<P: Eq + Show, V: Ord + Eq + Version>(root: P, p: P, r: Range<V>) -> string {
+pub fn show_term_body<P: Eq + Show, V: Version>(root: P, p: P, r: Range<V>) -> string {
     if (p == root) {
         return to_string(p);
     }
@@ -62,12 +62,12 @@ pub fn show_term_body<P: Eq + Show, V: Ord + Eq + Version>(root: P, p: P, r: Ran
     "${p} ${range.show_range(r)}"
 }
 
-fn body<P: Eq + Show, V: Ord + Eq + Version>(root: P, t: Term<P, V>) -> string {
+fn body<P: Eq + Show, V: Version>(root: P, t: Term<P, V>) -> string {
     show_term_body(root, pubgrub.term_pkg(t), pubgrub.term_range(t))
 }
 
 /// One incompatibility as a sentence fragment (no trailing period).
-pub fn describe<P: Eq + Show, V: Ord + Eq + Version>(root: P, inc: Incompat<P, V>) -> string {
+pub fn describe<P: Eq + Show, V: Version>(root: P, inc: Incompat<P, V>) -> string {
     let ts = inc.terms;
     match (inc.cause) {
         Cause.Root => return "${root} is the project being solved",
@@ -166,7 +166,7 @@ struct Report {
 }
 
 /// The failure as numbered English, one sentence per line.
-pub fn explain<P: Eq + Show, V: Ord + Eq + Version>(f: Failure<P, V>) -> string {
+pub fn explain<P: Eq + Show, V: Version>(f: Failure<P, V>) -> string {
     let rep = Report {
         lines: [],
         numbered: Map.new(),
@@ -230,7 +230,7 @@ pub fn explain<P: Eq + Show, V: Ord + Eq + Version>(f: Failure<P, V>) -> string 
 
 fn pad(s: string, w: int) -> string { s + " ".repeat(w - s.len()) }
 
-fn write<P: Eq + Show, V: Ord + Eq + Version>(
+fn write<P: Eq + Show, V: Version>(
     f: Failure<P, V>,
     rep: Report,
     idx: int,
@@ -252,11 +252,7 @@ fn lower_first(s: string) -> string {
     s.substring(0, 1).to_lower() + s.substring(1, s.len())
 }
 
-fn ref_text<P: Eq + Show, V: Ord + Eq + Version>(
-    f: Failure<P, V>,
-    rep: Report,
-    idx: int
-) -> string {
+fn ref_text<P: Eq + Show, V: Version>(f: Failure<P, V>, rep: Report, idx: int) -> string {
     let d = describe(f.root, f.incompats[idx]);
     match (rep.numbered.get(idx)) {
         Option.Some(n) => "${d} (${n})",
@@ -264,7 +260,7 @@ fn ref_text<P: Eq + Show, V: Ord + Eq + Version>(
     }
 }
 
-fn visit<P: Eq + Show, V: Ord + Eq + Version>(f: Failure<P, V>, rep: Report, idx: int, last: bool) {
+fn visit<P: Eq + Show, V: Version>(f: Failure<P, V>, rep: Report, idx: int, last: bool) {
     let inc = f.incompats[idx];
     let (a, b) = match (inc.cause) {
         Cause.Derived(a, b) => (a, b),
@@ -332,7 +328,7 @@ fn visit<P: Eq + Show, V: Ord + Eq + Version>(f: Failure<P, V>, rep: Report, idx
 }
 
 /// The derivation tree, indented, one incompatibility per line (`raysolve resolve --tree`).
-pub fn tree<P: Eq + Show, V: Ord + Eq + Version>(f: Failure<P, V>) -> string {
+pub fn tree<P: Eq + Show, V: Version>(f: Failure<P, V>) -> string {
     var out: [string] = [];
     for (idx, depth) in walk(f) {
         let inc = f.incompats[idx];

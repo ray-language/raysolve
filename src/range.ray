@@ -1,6 +1,6 @@
 //! Sets of versions as sorted, disjoint intervals — the algebra PubGrub runs on.
 //!
-//! Generic over any `V: Ord + Eq + Version`. Versions are treated as dense (between
+//! Generic over any `V: Version`. Versions are treated as dense (between
 //! `1.0.0` and `1.0.1` there are pre-releases), so `(a, b)` is non-empty whenever `a < b`.
 
 from version import Version;
@@ -23,14 +23,11 @@ pub struct Range<V> {
 }
 
 pub fn empty<V>() -> Range<V> {
-    let segs: [Seg<V>] = [];
-    Range { segs: segs }
+    Range { segs: [] }
 }
 
 pub fn full<V>() -> Range<V> {
-    // the return type does not reach the variants inside the literal: annotate the bound
-    let open: Bound<V> = Bound.Unbounded;
-    Range { segs: [Seg { lo: open, hi: open }] }
+    Range { segs: [Seg { lo: Bound.Unbounded, hi: Bound.Unbounded }] }
 }
 
 pub fn exact<V>(v: V) -> Range<V> {
@@ -39,26 +36,22 @@ pub fn exact<V>(v: V) -> Range<V> {
 
 /// `>= v`
 pub fn at_least<V>(v: V) -> Range<V> {
-    let open: Bound<V> = Bound.Unbounded;
-    Range { segs: [Seg { lo: Bound.Incl(v), hi: open }] }
+    Range { segs: [Seg { lo: Bound.Incl(v), hi: Bound.Unbounded }] }
 }
 
 /// `> v`
 pub fn above<V>(v: V) -> Range<V> {
-    let open: Bound<V> = Bound.Unbounded;
-    Range { segs: [Seg { lo: Bound.Excl(v), hi: open }] }
+    Range { segs: [Seg { lo: Bound.Excl(v), hi: Bound.Unbounded }] }
 }
 
 /// `< v`
 pub fn below<V>(v: V) -> Range<V> {
-    let open: Bound<V> = Bound.Unbounded;
-    Range { segs: [Seg { lo: open, hi: Bound.Excl(v) }] }
+    Range { segs: [Seg { lo: Bound.Unbounded, hi: Bound.Excl(v) }] }
 }
 
 /// `<= v`
 pub fn at_most<V>(v: V) -> Range<V> {
-    let open: Bound<V> = Bound.Unbounded;
-    Range { segs: [Seg { lo: open, hi: Bound.Incl(v) }] }
+    Range { segs: [Seg { lo: Bound.Unbounded, hi: Bound.Incl(v) }] }
 }
 
 /// `[lo, hi)`, or empty when `hi <= lo`.
@@ -207,8 +200,7 @@ pub fn complement<V>(r: Range<V>) -> Range<V> {
             Bound.Excl(x) => lo = Bound.Incl(x),
         }
     }
-    let open: Bound<V> = Bound.Unbounded;
-    out.push(Seg { lo: lo, hi: open });
+    out.push(Seg { lo: lo, hi: Bound.Unbounded });
     Range { segs: out }
 }
 
@@ -268,7 +260,7 @@ pub fn floor<V>(r: Range<V>) -> Option<V> {
 }
 
 /// Human form: `*`, `1.2.3`, `^0.14.0`, `>=1.0.0, <1.5.0`, joined with ` || `.
-pub fn show_range<V: Ord + Eq + Version>(r: Range<V>) -> string {
+pub fn show_range<V: Version>(r: Range<V>) -> string {
     if (is_empty(r)) {
         return "∅";
     }
@@ -282,7 +274,7 @@ pub fn show_range<V: Ord + Eq + Version>(r: Range<V>) -> string {
     parts.join(" || ")
 }
 
-fn show_seg<V: Ord + Eq + Version>(s: Seg<V>) -> string {
+fn show_seg<V: Version>(s: Seg<V>) -> string {
     match (s.lo) {
         Bound.Incl(a) => match (s.hi) {
             Bound.Incl(b) => if (a == b) {

@@ -1,11 +1,8 @@
-//! What the generic solver needs from a version type, beyond `Ord + Hash + Eq + Show`.
-//!
-//! raylang has no supertraits (`trait Version: Ord + Hash` is a syntax error), so the
-//! solver spells the full bound at every generic function instead:
-//! `V: Ord + Hash + Eq + Show + Version`.
+//! What the generic solver needs from a version type. `Ord + Hash + Eq + Show` are
+//! supertraits, so a generic function asks for `V: Version` alone.
 
 /// A version the solver can pick.
-pub trait Version {
+pub trait Version: Ord + Hash + Eq + Show {
     /// Pre-releases are only picked when nothing else fits and the caller allows them.
     fn is_prerelease(self) -> bool;
     /// The version as people write it (`1.2.3-rc.1`), for reports.
