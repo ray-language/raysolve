@@ -103,9 +103,11 @@ a dos saltos), una pre-versión pedida por nombre y un paquete inexistente.
 | `synth.ray` | índices sintéticos con un LCG propio en `u64` (mismos números en VM y nativo) |
 
 El resolutor no sabe nada de semver: los tests lo usan con versiones `int` y paquetes `string`, y
-la CLI con `SemVer`. Como raylang no tiene supertraits ni traits genéricos en los bounds, el
-bound se escribe entero (`V: Ord + Hash + Eq + Show + Version`) y el índice llega como un struct
-de closures en vez de un `S: Source<V>`.
+la CLI con `SemVer`. `Version` declara `Ord + Hash + Eq + Show` como supertraits, así que el
+bound es `V: Version`. El índice llega como un `Provider`, un struct de dos closures que comparten
+las cachés que monta quien lo crea (`resolve.provider`). Cuando se escribió, raylang no admitía
+traits genéricos en los bounds (`S: Source<V>`); desde 1.27.108 sí, pero el struct de closures se
+queda porque no ata el estado del resolutor a un tercer parámetro de tipo.
 
 ## Rendimiento
 
@@ -134,7 +136,7 @@ el 5,7 %.
 
 | Qué | Estado |
 |---|---|
-| Semver, rangos, requisitos, resolutor, explicaciones, fuentes, CLI | **34 tests** en VM y nativo (`make test`, `make test-native`), raylang 1.27.103 |
+| Semver, rangos, requisitos, resolutor, explicaciones, fuentes, CLI | **34 tests** en VM y nativo (`make test`, `make test-native`), raylang 1.27.110 |
 | VM frente a nativo | `make diff`: 14 órdenes con la misma salida en los dos motores |
 | Índices de disco | `make stress`: 600 paquetes escritos y leídos de JSON |
 
@@ -146,9 +148,10 @@ historia suficiente.
 
 Once bugs y huecos de raylang, con su reproducción mínima (raylang 1.27.95), registrados en
 `ray-apps/findings/` (campaña `raysolve-1.27.95`) como #352–#362, en este mismo orden. Re-medidos
-con 1.27.103 (campaña `raysolve-1.27.103`): siete arreglados, dos a medias y dos que siguen igual.
-Los rodeos de los arreglados ya se quitaron del código, salvo el del punto 9. Los que quedan están
-marcados en el código.
+con 1.27.103, 1.27.107, 1.27.108 y 1.27.110 (una campaña `raysolve-<versión>` por release): de los
+doce (con el punto 12), once arreglados y uno a medias. Los rodeos de los arreglados ya se
+quitaron del código, salvo el del punto 9. Los que quedan (tres `let` anotados, punto 7) están
+marcados en el código. El punto 12 apareció con 1.27.107 y se arregló en 1.27.110.
 
 1. **[B]** Un `for` sobre un iterador propio cuyo `impl` lleva bounds (`impl<V: Ord>
    Iterator<V> for InRange<V>`) **rompe los dos motores**: la VM aborta con «ICE: the checker
@@ -176,16 +179,20 @@ marcados en el código.
    'while'»), ni supertraits (`trait Version: Ord + Hash` → «expected '{' after the trait name»),
    ni traits genéricos en bounds o `dyn` (`S: Source<V>`, `dyn Source<V>` no parsean, aunque `trait
    Source<V>` e `impl<V> Source<V> for X<V>` sí). Ninguna de las tres cosas está documentada.
-   **❌ 1.27.103**: sigue igual y sin documentar.
+   **✅ 1.27.108**: hay `while let` (sin paréntesis), supertraits (`Version` los usa) y traits
+   genéricos en bounds (`S: Source<V>`), y la doc los recoge. `dyn Source<V>` sigue sin existir,
+   pero el error lo explica y la doc lo dice.
 7. **[E]** La inferencia no baja del contexto a los genéricos: `Bound.Unbounded` en un campo o un
    argumento cuando el tipo esperado es `Bound<V>`, `range.empty()` como argumento, `[]` como
    elemento de `[[int]]`, o `Solution { picks: [("net", 14)] }` con `picks: [(P, V)]` («must be (P,
    V), not (string, int)») piden anotación; solo un `let x: T = …` la da, y no hay sintaxis de
    argumentos de tipo explícitos.
-   **⚠️ 1.27.103**: ya funcionan el struct genérico con tuplas y una llamada genérica pasada a un
-   parámetro concreto; con un parámetro genérico (`Term.Neg(p, range.empty())`, `satisfier_of(…,
-   any_term(…), …)`, `range.full()` en una rama de `if`) sigue pidiendo el `let` anotado, igual que
-   `Bound.Unbounded`, `[]` anidado y `none::<V>()`.
+   **⚠️ 1.27.110**: ya funcionan el struct genérico con tuplas, `Bound.Unbounded`, el `[]` anidado y
+   una llamada genérica pasada a un parámetro concreto o a un constructor de enum (`Term.Neg(p,
+   range.empty())`). Desde 1.27.108 `V` también se infiere de otro argumento o de la otra rama de
+   un `if`, pero solo si es un tipo concreto: dentro de una función genérica (el caso de
+   `satisfier_of(st, t, any_term(…), …)` y `range.full()` en `dep_span`) sigue pidiendo el `let`
+   anotado. No hay `none::<V>()`, y ahora la doc lo dice.
 8. **[B]** `print(x)` ignora un `impl Show` escrito a mano (imprime `Plain { n: 1 }`), mientras
    `to_string(x)` y `"${x}"` sí lo usan. Y al revés en genéricos: `to_string(p)` y `"${p}"` con `p:
    P`, `P: Show`, no compilan («to_string only converts int/…»); hay que escribir `p.show()`.
@@ -199,12 +206,18 @@ marcados en el código.
 10. **[B]** En un proyecto sin `src/main.ray`, `ray test tests/x_test.ray` no encuentra los
     módulos de `src/` (y la lista de rutas que muestra incluye el directorio padre y `tests` dos
     veces); `ray test` a secas sí.
-    **❌ 1.27.103**: sigue igual.
+    **✅ 1.27.107**: `ray test tests/x_test.ray` ya encuentra los módulos de `src/`.
 11. **[D]** §9 (Iteradores) dice que `Iter<T>` está «respaldado por un closure» pero no cuenta
     cómo crear uno desde un closure, ni que un `impl Iterator<T>` propio hereda `map`, `take`,
     `collect`… (sí lo hace), ni la restricción del punto 1.
-    **⚠️ 1.27.103**: ya dice que un iterador propio hereda los adaptadores; faltan el ejemplo y cómo
-    crear un `Iter<T>` desde un closure.
+    **✅ 1.27.108**: §9 trae «An iterator of your own», con un ejemplo genérico con bound que
+    hereda los adaptadores y avisa de que un literal de struct no va en la cabeza del `for`. Queda
+    menor: no dice cómo crear un `Iter<T>` desde un closure.
+12. **[B]** `to_string(x)` de un struct dentro de una interpolación (`"${to_string(v)}"`) rompe
+    los dos motores: ICE en la VM («the checker guarantees an object») y E0308 en nativo, que
+    aplica `show` dos veces. `ray check` lo acepta. Basta con `"${v}"` o un `let` intermedio.
+    Registrado como #456 (campaña `raysolve-1.27.107`).
+    **✅ 1.27.110**: imprime `N { n: 2 }` en los dos motores, también con genéricos y supertraits.
 
 Lo que salió bien a la primera: `impl Ord` a mano usado por `sort`, `std/sort` (`binary_search`,
 `dedup`, `merge`, `sort_desc`, `max`) y `sort_by`; claves `@derive(Hash, Eq)` en colecciones;

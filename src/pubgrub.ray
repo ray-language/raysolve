@@ -2,10 +2,10 @@
 //! unit propagation over incompatibilities, conflict-driven learning with backjumping, and a
 //! derivation graph that explains a failure in human terms (see `explain`).
 //!
-//! Generic over the package type `P` and the version type `V`. raylang has no supertraits and
-//! no generic traits in bounds (`S: Source<V>` does not parse), so the bound is spelled in full
-//! and the package index reaches the solver as a `Provider` of two closures. The per-package
-//! tables are native `Map`s, which is why `P` carries `MapKey`.
+//! Generic over the package type `P` and the version type `V: Version`. The package index
+//! reaches the solver as a `Provider` of two closures, which share whatever caches the caller
+//! builds around them. The per-package tables are native `Map`s, which is why `P` carries
+//! `MapKey`.
 
 import range;
 from range import Range;
@@ -125,9 +125,7 @@ fn negate<P, V>(t: Term<P, V>) -> Term<P, V> {
 
 /// "p is anything (or nothing)": the neutral element of term intersection.
 fn any_term<P, V>(p: P) -> Term<P, V> {
-    // typed let: a generic call does not take its type from a generic parameter (findings #358)
-    let none: Range<V> = range.empty();
-    Term.Neg(p, none)
+    Term.Neg(p, range.empty())
 }
 
 fn intersect_terms<P, V: Ord>(a: Term<P, V>, b: Term<P, V>) -> Term<P, V> {
@@ -401,6 +399,8 @@ fn resolve_conflict<P: MapKey + Eq, V: Ord>(st: State<P, V>, conflict: int) -> R
         var i = 0;
         while (i < inc.terms.len()) {
             let t = inc.terms[i];
+            // typed let: a generic call whose `V` only a sibling argument fixes is not inferred
+            // when that `V` is itself a type parameter (#358)
             let anything: Term<P, V> = any_term(term_pkg(t));
             let s = satisfier_of(st, t, anything, st.assigns.len());
             if (s > sat) {
@@ -421,6 +421,7 @@ fn resolve_conflict<P: MapKey + Eq, V: Ord>(st: State<P, V>, conflict: int) -> R
         while (i < inc.terms.len()) {
             if (i != term_i) {
                 let t = inc.terms[i];
+                // typed let: same as above (#358)
                 let anything: Term<P, V> = any_term(term_pkg(t));
                 let s = satisfier_of(st, t, anything, st.assigns.len());
                 if (s >= 0 && st.assigns[s].level > prev) {
@@ -499,7 +500,7 @@ fn versions_of<P: MapKey + Eq, V>(st: State<P, V>, p: P) -> Result<[V], string> 
 }
 
 /// The best version of a range: the highest release, else the highest pre-release.
-fn pick<V: Ord + Version>(vs: [V], r: Range<V>) -> Option<V> {
+fn pick<V: Version>(vs: [V], r: Range<V>) -> Option<V> {
     var best: Option<V> = Option.None;
     for v in range.in_range(vs, r) {
         if (!v.is_prerelease()) {
@@ -557,6 +558,8 @@ fn dep_span<P: MapKey + Eq, V: Ord + Eq>(
     while (hi + 1 < vs.len() && same_dep(st, p, vs[hi + 1], q, r)) {
         hi = hi + 1;
     }
+    // typed let: `V` of `range.full()` is not inferred from the other `if` branch when `V` is
+    // a type parameter (#358)
     let whole: Range<V> = range.full();
     let low = if (lo == 0) { whole } else { range.at_least(vs[lo]) };
     let high = if (hi == vs.len() - 1) { whole } else { range.below(vs[hi + 1]) };
@@ -613,7 +616,7 @@ pub struct Options {
 pub fn options() -> Options { Options { max_steps: 1000000 } }
 
 /// Find versions for `root` (at `root_version`) and everything it depends on.
-pub fn solve<P: MapKey + Eq + Show, V: Ord + Hash + Eq + Show + Version>(
+pub fn solve<P: MapKey + Eq + Show, V: Version>(
     prov: Provider<P, V>,
     root: P,
     root_version: V,
